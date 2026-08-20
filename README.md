@@ -1,100 +1,96 @@
 # ICM-45686 Driver
 
-Driver for the TDK ICM-45686 6-axis inertial measurement unit.
+Embedded C driver for the TDK ICM-45686 6-axis inertial sensor, combining a 3-axis accelerometer and a 3-axis gyroscope.
 
-The driver provides SPI access to the ICM-45686 accelerometer and gyroscope, including sensor configuration, direct register access, FIFO handling, interrupt configuration and indirect IREG access.
+The project consists of a low-level SPI driver for direct device access and two optional FreeRTOS state-machine layers for interrupt-driven sensor data acquisition.
+
+The low-level driver provides sensor initialization, reset and identification, accelerometer and gyroscope configuration, direct register data access, FIFO operation, interrupt configuration and access to both Bank0 and indirect IREG registers.
 
 ## Features
 
-- SPI communication through `spi_hal`
-- Device initialization and soft reset
-- `WHO_AM_I` verification
-- Accelerometer and gyroscope mode control
-- Output data rate configuration
-- Accelerometer and gyroscope full-scale range configuration
-- Low-Power averaging configuration
-- Low-Noise bandwidth configuration
-- Direct accelerometer, gyroscope and temperature data reads
-- FIFO configuration and status handling
-- FIFO stream, snapshot and bypass modes
-- 8-, 16- and 20-byte FIFO frame parsing
-- High-resolution 20-bit FIFO data support
-- FIFO watermark configuration
-- FIFO flush and frame count handling
-- INT1 and INT2 source configuration
-- Interrupt pin polarity, mode and drive configuration
-- Interrupt status reading
-- Accelerometer Low-Power clock selection
-- Direct Bank0 register access
-- Indirect 16-bit IREG access
-- Register definitions for Bank0 and internal register banks
+* SPI communication with the ICM-45686
+* Sensor soft reset and device identification check
+* Accelerometer and gyroscope power-mode configuration
+* Output data rate and full-scale range configuration
+* Low-Power averaging and Low-Noise bandwidth configuration
+* Reading accelerometer, gyroscope and temperature data
+* FIFO configuration, flushing and frame reading
+* Standard and high-resolution FIFO data handling
+* INT1 and INT2 source and pin configuration
+* Direct Bank0 register access
+* Indirect IREG access
+* Optional FreeRTOS state machine using data-ready interrupts
+* Optional FreeRTOS state machine using FIFO watermark interrupts
 
 ## Files
 
-- `icm45686.c` - driver implementation
-- `icm45686.h` - public driver API
-- `icm45686_def.h` - register definitions, configuration enums and data structures
+### `icm45686.c`
 
-## Interface
+Low-level ICM-45686 driver implementation.
 
-The driver uses the project SPI HAL through `struct spi_hal_dev`.
+It provides SPI-based device access, reset and identification, accelerometer and gyroscope configuration, sensor data reads, FIFO handling, interrupt configuration and access to the device register spaces.
 
-The device descriptor is represented by:
+### `icm45686.h`
 
-```c
-typedef struct icm_45686_dsc *icm_45686;
-```
+Public interface of the low-level driver.
 
-and contains the SPI device descriptor together with the currently configured FIFO frame size.
+It contains the public API declarations for device initialization, sensor configuration, data acquisition, FIFO operation, interrupt handling and direct register access.
 
-All public driver functions return `0` on success and a negative error code on failure.
+### `icm45686_def.h`
 
-## Sensor data
+ICM-45686 register and data definitions.
 
-Direct register reads provide:
+It contains register addresses, configuration values, register layouts, interrupt structures, sensor data structures, FIFO configuration and FIFO frame definitions used by the driver.
 
-- 3-axis accelerometer data
-- 3-axis gyroscope data
-- temperature data
+### `icm45686_stm_regs.c`
 
-The driver converts the sensor register byte order to the native little-endian representation used by the target system.
+FreeRTOS state-machine layer using the ICM-45686 data-ready interrupt.
 
-## FIFO
+It initializes and configures the sensor, waits for completed measurements and reads accelerometer, gyroscope and temperature data directly from the sensor registers.
 
-The FIFO can be configured for:
+### `icm45686_stm_regs.h`
 
-- accelerometer data
-- gyroscope data
-- combined accelerometer and gyroscope data
-- high-resolution 20-bit data
-- watermark threshold
-- stream, snapshot or bypass operation
-- supported FIFO depth settings
+Public interface of the register-data state-machine layer.
 
-FIFO frames are decoded according to the configured format:
+It provides initialization of the corresponding FreeRTOS sensor task.
 
-- 8-byte frame for a single sensor
-- 16-byte frame for accelerometer + gyroscope
-- 20-byte high-resolution frame
+### `icm45686_stm_fifo.c`
 
-## Interrupts
+FreeRTOS state-machine layer using FIFO watermark interrupts.
 
-INT1 and INT2 can be configured independently for supported interrupt sources, including:
+It initializes and configures the sensor and FIFO, waits for FIFO events and processes the available FIFO frames.
 
-- FIFO full
-- FIFO watermark
-- data ready
-- FSYNC
-- reset done
-- PLL ready
-- wake-on-motion
-- I3C protocol error
-- I2C master done
-- EDMP/APEX event
+### `icm45686_stm_fifo.h`
 
-Interrupt pin polarity, pulse/latch mode and push-pull/open-drain drive can also be configured.
+Public interface of the FIFO state-machine layer.
+
+It provides initialization of the corresponding FreeRTOS sensor task.
+
+## Dependencies
+
+The low-level driver depends on:
+
+* a project-specific SPI HAL
+* FreeRTOS timing support
+* project-specific common, timing and error-handling facilities
+
+The state-machine layers additionally use FreeRTOS tasks and synchronization primitives together with project-specific GPIO, pinmux, command-line and diagnostic facilities.
+
+These dependencies are intentionally kept outside this repository and must be provided by the target project.
+
+## Usage
+
+An application may use the low-level driver directly when it needs explicit control over sensor configuration, data acquisition, FIFO operation or interrupt handling.
+
+Two example state-machine layers are provided for continuous interrupt-driven acquisition. The register-data variant reads measurements directly after the sensor signals data availability, while the FIFO variant acquires measurements through the internal FIFO using its watermark interrupt.
+
+SPI configuration, GPIO assignment, interrupt type, sensor operating parameters and optional measurement reporting are target-specific and are expected to be configured by the surrounding project.
+
+## License
+
+See the license information in the source files.
 
 ## Author
 
 Jan Rusnak  
-Copyright (c) 2025 AZTech
+AZTech
