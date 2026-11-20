@@ -19,6 +19,10 @@
 #ifndef ICM45686_DEF_H
 #define ICM45686_DEF_H
 
+#include <stdint.h>
+#include "spi_hal.h"
+
+/** @brief Values used for sensor enable/disable configuration fields. */
 enum icm_45686_bool {
 	ICM_45686_DISABLE,
 	ICM_45686_ENABLE
@@ -29,6 +33,7 @@ enum icm_45686_bool {
 #define ICM_45686_GYR_STARTUP_TIME_US 70000
 
 // Interrupt number
+/** @brief Interrupt output selector for INT1/INT2 configuration and status. */
 enum icm_45686_int_num {
 	ICM_45686_INT1,
 	ICM_45686_INT2
@@ -196,7 +201,13 @@ struct icm_45686_int1_config1 {
 	uint8_t resv_1 : 1;
 };
 
-// Interrupts configuration register 0 & 1
+/**
+ * @brief Interrupt-source selection or reported interrupt status.
+ *
+ * All 15 fields are individual 0/1 flags. For configuration, the full bitmap
+ * replaces the enabled sources on the selected interrupt output. For status,
+ * the fields are decoded from the hardware's read-to-clear registers.
+ */
 struct icm_45686_int_bitmap {
 	// INT1_CONFIG0
 	uint8_t fifo_full;
@@ -243,7 +254,12 @@ enum icm_45686_int1_config2_polarity {
 	ICM_45686_INT1_CONFIG2_POLARITY_HIGH = 0x01
 };
 
-// Interrupts configuration register 2
+/**
+ * @brief Electrical and signaling configuration for an INT output pin.
+ *
+ * Polarity, PULSE/LATCH mode, and push-pull/open-drain drive use the
+ * ICM_45686_INT1_CONFIG2_* selector enums for either INT1 or INT2.
+ */
 struct icm_45686_int_pin_cfg {
 	enum icm_45686_int1_config2_polarity polarity;
 	enum icm_45686_int1_config2_mode mode;
@@ -1474,7 +1490,13 @@ struct icm_45686_ipreg_bar_reg_62 {
 	uint8_t resv_2 : 5;
 };
 
-// Sensor data from registers
+/**
+ * @brief Decoded UI data-register samples: accel XYZ, gyro XYZ, temperature.
+ *
+ * Values are signed 16-bit raw device LSB, not physical units. Scaling of
+ * accel/gyro depends on configured FSR. Temperature C = 25 + temp_data/128.
+ * Byte-order conversion is performed by icm_45686_get_reg_data().
+ */
 struct icm_45686_sensor_data {
 	int16_t accel_data[3];
 	int16_t gyro_data[3];
@@ -1498,16 +1520,26 @@ struct icm_45686_sensor_data {
 
 // FIFO configuration
 
+/** @brief Invalid signed 16-bit FIFO sample/temperature marker. */
 #define ICM_45686_INVALID_VALUE_FIFO ((int16_t) 0x8000)
+/** @brief Invalid signed 8-bit FIFO temperature marker. */
 #define ICM_45686_INVALID_VALUE_FIFO_1B ((int8_t) 0x80)
 
+/**
+ * @brief Fixed-format internal-sensor FIFO configuration.
+ *
+ * Enable values must be 0 or 1. Non-bypass mode requires accel or gyro.
+ * HIRES requires both, and produces a 20-byte packet; otherwise one enabled
+ * sensor produces 8-byte packets and two produce 16-byte packets.
+ * Compression and external-sensor FIFO insertion are not represented here.
+ */
 struct icm_45686_fifo_config {
-	uint8_t gyro_en; /**< Enable Gyro in FIFO */
-	uint8_t accel_en; /**< Enable Accel in FIFO */
-	uint8_t hires_en; /**< Enable High Resolution mode (20-bits long data) */
-	uint16_t fifo_wm_th; /**< Watermark threshold value */
-	enum icm_45686_fifo_config0_mode fifo_mode; /**< Operating mode of the FIFO */
-	enum icm_45686_fifo_config0_depth fifo_depth; /**< FIFO size */
+	uint8_t gyro_en; /**< Include gyro samples (0/1). */
+	uint8_t accel_en; /**< Include accel samples (0/1). */
+	uint8_t hires_en; /**< Use high-resolution 20-byte frames (0/1). */
+	uint16_t fifo_wm_th; /**< FIFO watermark in packets; 0 disables it. */
+	enum icm_45686_fifo_config0_mode fifo_mode; /**< Bypass, stream, or snapshot. */
+	enum icm_45686_fifo_config0_depth fifo_depth; /**< Encoded depth selection. */
 };
 
 // FIFO config registers
@@ -1520,7 +1552,13 @@ struct icm_45686_fifo_config_regs {
 	struct icm_45686_fifo_config4 config4;
 } __attribute__((__packed__));
 
-// Describe the content of the FIFO header
+/**
+ * @brief One-byte FIFO packet header and decoded bit flags.
+ *
+ * Header bits identify accel/gyro source, high-resolution format,
+ * timestamp/FSYNC tag and per-sensor ODR changes. The header is preserved
+ * verbatim by icm_45686_get_fifo_frame().
+ */
 union icm_45686_fifo_header {
 	uint8_t byte;
 	struct {
@@ -1535,7 +1573,18 @@ union icm_45686_fifo_header {
 	} bits;
 };
 
-// One frame of FIFO header+data
+/**
+ * @brief Decoded fixed-format FIFO sample produced by get_fifo_frame().
+ *
+ * Select byte_8, byte_16 or byte_20 from the configured fifo_frame_size.
+ * All axes are signed raw LSB; 20-bit axes are sign-extended to int32_t.
+ * In byte_8, the header distinguishes an accel-only from a gyro-only packet.
+ * The byte_8/byte_16 temperature is signed 8-bit (2 LSB/degree C);
+ * byte_20 temperature is signed 16-bit (128 LSB/degree C). Add 25 degrees C.
+ * The 16-bit FIFO timestamp is a raw counter or FSYNC delay according to
+ * device settings; the driver does not interpret or scale it.
+ * Invalid sample markers are defined above and are not filtered by the LL.
+ */
 union icm_45686_fifo_frame {
 	union icm_45686_fifo_header header;
 	struct {
@@ -1559,14 +1608,45 @@ union icm_45686_fifo_frame {
 	} byte_20;
 };
 
+/** @brief Pointer alias for the caller-owned ICM-45686 device descriptor. */
 typedef struct icm_45686_dsc *icm_45686;
 
+/**
+ * @brief Device state with an embedded SPI HAL descriptor.
+ *
+ * The caller allocates this object for the whole device lifetime, initializes
+ * spi.cfg before init_icm_45686(), and manages exclusive task ownership.
+ * A successful set_fifo_config() updates fifo_frame_size; resetting the sensor
+ * or reading its FIFO configuration does not update this software field.
+ */
 struct icm_45686_dsc {
-	struct spi_hal_dev spi;
-	int fifo_frame_size;
+	struct spi_hal_dev spi; /**< SPI configuration and HAL implementation state. */
+	int fifo_frame_size; /**< Expected FIFO packet length: 0, 8, 16 or 20 bytes. */
 };
 
 _Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "Only little-endian supported");
-_Static_assert(sizeof(struct icm_45686_pwr_mgmt0) == 1, "not 1 byte");
+_Static_assert(sizeof(struct icm_45686_drive_config0) == 1, "icm_45686_drive_config0 size");
+_Static_assert(sizeof(struct icm_45686_pwr_mgmt0) == 1, "icm_45686_pwr_mgmt0 size");
+_Static_assert(sizeof(struct icm_45686_accel_config0) == 1, "icm_45686_accel_config0 size");
+_Static_assert(sizeof(struct icm_45686_gyro_config0) == 1, "icm_45686_gyro_config0 size");
+_Static_assert(sizeof(struct icm_45686_ipreg_sys2_reg_129) == 1, "icm_45686_ipreg_sys2_reg_129 size");
+_Static_assert(sizeof(struct icm_45686_ipreg_sys1_reg_170) == 1, "icm_45686_ipreg_sys1_reg_170 size");
+_Static_assert(sizeof(struct icm_45686_ipreg_sys2_reg_131) == 1, "icm_45686_ipreg_sys2_reg_131 size");
+_Static_assert(sizeof(struct icm_45686_ipreg_sys1_reg_172) == 1, "icm_45686_ipreg_sys1_reg_172 size");
+_Static_assert(sizeof(struct icm_45686_fifo_config0) == 1, "icm_45686_fifo_config0 size");
+_Static_assert(sizeof(struct icm_45686_fifo_config2) == 1, "icm_45686_fifo_config2 size");
+_Static_assert(sizeof(struct icm_45686_fifo_config3) == 1, "icm_45686_fifo_config3 size");
+_Static_assert(sizeof(struct icm_45686_fifo_config4) == 1, "icm_45686_fifo_config4 size");
+_Static_assert(sizeof(struct icm_45686_fifo_config_regs) == 6, "icm_45686_fifo_config_regs size");
+_Static_assert(sizeof(struct icm_45686_smc_control_0) == 1, "icm_45686_smc_control_0 size");
+_Static_assert(sizeof(struct icm_45686_int1_config0) == 1, "icm_45686_int1_config0 size");
+_Static_assert(sizeof(struct icm_45686_int1_config1) == 1, "icm_45686_int1_config1 size");
+_Static_assert(sizeof(struct icm_45686_int1_config2) == 1, "icm_45686_int1_config2 size");
+_Static_assert(sizeof(struct icm_45686_int_cfg_01_regs) == 2, "icm_45686_int_cfg_01_regs size");
+_Static_assert(sizeof(struct icm_45686_int1_status0) == 1, "icm_45686_int1_status0 size");
+_Static_assert(sizeof(struct icm_45686_int1_status1) == 1, "icm_45686_int1_status1 size");
+_Static_assert(sizeof(struct icm_45686_int_stat_01_regs) == 2, "icm_45686_int_stat_01_regs size");
+_Static_assert(sizeof(struct icm_45686_sensor_data) == 14, "icm_45686_sensor_data size");
+_Static_assert(sizeof(union icm_45686_fifo_header) == 1, "icm_45686_fifo_header size");
 
 #endif

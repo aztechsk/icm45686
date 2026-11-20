@@ -10,7 +10,7 @@
 #include <semphr.h>
 #include <queue.h>
 #include <stdio.h>
-#include <string.h>
+#include <stdarg.h>
 #include <gentyp.h>
 #include "sysconf.h"
 #include "board.h"
@@ -25,22 +25,76 @@
 #include "icm45686.h"
 #include "icm45686_stm_fifo.h"
 
+#ifndef ICM45686_SENSOR_MODE
+#error "ICM45686_SENSOR_MODE not defined; define it in sysconf.h"
+#endif
+#ifndef ICM45686_FIFO_MODE
+#error "ICM45686_FIFO_MODE not defined; define it in sysconf.h"
+#endif
+
 #if ICM45686_SENSOR_MODE == ICM45686_FIFO_MODE
 
 #define RESET_STM_TMO_MS 5000
 #define WAIT_ISR_SIG_TMO_MS 50
+#define ICM45686_REPORT_TO_MSG 1U
+#define ICM45686_REPORT_TO_CALLBACK 2U
+
+#if ICM45686_REPORT_MSG_NUM == 1
+#define ICM45686_REPORT_NUM_FMT " [%03u]"
+#define ICM45686_REPORT_NUM_LINE(dest, fmt) report_line((dest), (fmt), msg_num)
+#define ICM45686_REPORT_NUM_LINE_ARGS(dest, fmt, ...) report_line((dest), (fmt), msg_num, __VA_ARGS__)
+#else
+#define ICM45686_REPORT_NUM_FMT ""
+#define ICM45686_REPORT_NUM_LINE(dest, fmt) report_line((dest), (fmt))
+#define ICM45686_REPORT_NUM_LINE_ARGS(dest, fmt, ...) report_line((dest), (fmt), __VA_ARGS__)
+#endif
+
+#if ICM45686_REPORT_ACCEL_SI < 0 || ICM45686_REPORT_ACCEL_SI > 3 || \
+    ICM45686_REPORT_GYRO_SI < 0 || ICM45686_REPORT_GYRO_SI > 3 || \
+    ICM45686_REPORT_ACCEL_LSB < 0 || ICM45686_REPORT_ACCEL_LSB > 3 || \
+    ICM45686_REPORT_GYRO_LSB < 0 || ICM45686_REPORT_GYRO_LSB > 3 || \
+    ICM45686_REPORT_FIFO_TMSTMP < 0 || ICM45686_REPORT_FIFO_TMSTMP > 3
+#error "ICM45686_REPORT_* values must be 0 (off), 1 (msg), 2 (callback), or 3 (both)"
+#endif
+#if ICM45686_REPORT_FN == 0 && \
+    ((ICM45686_REPORT_ACCEL_SI & 2) || (ICM45686_REPORT_GYRO_SI & 2) || \
+     (ICM45686_REPORT_ACCEL_LSB & 2) || (ICM45686_REPORT_GYRO_LSB & 2) || \
+     (ICM45686_REPORT_FIFO_TMSTMP & 2))
+#error "ICM45686_REPORT_FN must be 1 when a text report is routed to the callback"
+#endif
+
+#if ICM45686_REPORT_FN == 1
+#define ICM45686_REPORT_BUF_SIZE 192U
+#endif
 
 static TaskHandle_t tsk_hndl;
 static struct icm_45686_dsc icm_45686_dsc;
 static icm_45686 icm = &icm_45686_dsc;
 static p_stf_t stmf;
 static SemaphoreHandle_t isr_sig;
+#if ICM45686_REPORT_FN == 1
+static boolean_t (*report_clbk)(const char *);
+static char *report_buf;
+#endif
+#if ICM45686_REPORT_SAMPLE_FN == 1
+static boolean_t (*sample_clbk)(const struct icm45686_fifo_sample *);
+#endif
 
 static struct {
 	unsigned int read_frame_cnt;
+	unsigned int fifo_full_cnt;
+	volatile unsigned int irq_pin_high_cnt;
+	unsigned int timeout_fifo_nonempty_cnt;
+	unsigned int max_fifo_backlog;
 	unsigned int unknown_intr_cnt;
 	unsigned int fifo_empty_err_cnt;
 	unsigned int stm_rst_cnt;
+#if ICM45686_REPORT_FN == 1
+	unsigned int report_fn_err_cnt;
+#endif
+#if ICM45686_REPORT_SAMPLE_FN == 1
+	unsigned int sample_fn_err_cnt;
+#endif
 } stats;
 
 static gfp_t state_sw_reset(void);
@@ -72,15 +126,40 @@ void init_icm45686_stm_fifo(void)
 	icm->spi.cfg.csel_cont = gpio_hal_get_ctrl(ICM45686_CS_CONT_ID);
 	icm->spi.cfg.csel_pin = ICM45686_CS_PIN_ID;
 	init_icm_45686(icm);
-	if (NULL == (isr_sig = xSemaphoreCreateBinary())) {
+#if ICM45686_REPORT_FN == 1
+	if ((report_buf = pvPortMalloc(ICM45686_REPORT_BUF_SIZE)) == NULL) {
+		crit_err_exit(MALLOC_ERROR);
+	}
+#endif
+	if ((isr_sig = xSemaphoreCreateBinary()) == NULL) {
 		crit_err_exit(MALLOC_ERROR);
 	}
 	add_command_noargs("icms", cmd_icms);
-        if (pdPASS != xTaskCreate(tsk, "ICM45686", ICM45686_TASK_STACK_SIZE, NULL,
-                                  ICM45686_TASK_PRIO, &tsk_hndl)) {
-                crit_err_exit(MALLOC_ERROR);
-        }
+	if (xTaskCreate(tsk, "ICM45686", ICM45686_TASK_STACK_SIZE, NULL,
+			ICM45686_TASK_PRIO, &tsk_hndl) != pdPASS) {
+		crit_err_exit(MALLOC_ERROR);
+	}
 }
+
+#if ICM45686_REPORT_FN == 1
+/**
+ * icm45686_stm_set_report_fn
+ */
+void icm45686_stm_set_report_fn(boolean_t (*report_fn)(const char *))
+{
+	report_clbk = report_fn;
+}
+#endif
+
+#if ICM45686_REPORT_SAMPLE_FN == 1
+/**
+ * icm45686_stm_set_sample_fn
+ */
+void icm45686_stm_set_sample_fn(boolean_t (*sample_fn)(const struct icm45686_fifo_sample *))
+{
+	sample_clbk = sample_fn;
+}
+#endif
 
 /**
  * state_sw_reset
@@ -149,11 +228,12 @@ static gfp_t intr_cfg(void)
 	pin_cfg.mode = ICM_45686_INT1_CONFIG2_MODE_PULSE;
 	pin_cfg.drive = ICM_45686_INT1_CONFIG2_DRIVE_PP;
 #else
- #error "ICM45686_INTR_TYPE unknown"
+#error "ICM45686_INTR_TYPE unknown"
 #endif
 	if ((ret = icm_45686_set_config_int_pin(icm, ICM_45686_INT1, &pin_cfg))) {
 		goto err;
 	}
+	int_cfg.fifo_full = ICM_45686_ENABLE;
 	int_cfg.fifo_ths = ICM_45686_ENABLE;
 	if ((ret = icm_45686_set_config_int_source(icm, ICM_45686_INT1, &int_cfg))) {
 		goto err;
@@ -170,7 +250,7 @@ static gfp_t intr_cfg(void)
 #elif ICM45686_INTR_TYPE == FALL_EDGE_INTR_TYPE
 	gpio_hal_intr_config(ICM45686_INT1_CONT, ICM45686_INT1_PIN, GPIO_HAL_INTR_FALLING);
 #else
- #error "ICM45686_INTR_TYPE unknown"
+#error "ICM45686_INTR_TYPE unknown"
 #endif
 	if (!gpio_hal_isr_registered(ICM45686_INT1_CONT, int1_isr_clbk)) {
 		gpio_hal_isr_register(ICM45686_INT1_CONT, int1_isr_clbk);
@@ -245,18 +325,24 @@ static gfp_t wait_intr(void)
 	struct icm_45686_int_bitmap is;
 	union icm_45686_fifo_frame frame;
 
-	if (pdFALSE == xSemaphoreTake(isr_sig, ms_to_os_ticks(WAIT_ISR_SIG_TMO_MS))) {
+	if (xSemaphoreTake(isr_sig, ms_to_os_ticks(WAIT_ISR_SIG_TMO_MS)) == pdFALSE) {
 		return ((gfp_t) ping_icm);
 	}
 	if ((ret = icm_45686_get_int_status(icm, ICM_45686_INT1, &is))) {
 		msg(INF, "ICM45686: get_int_status() error (%s)\n", hwerr_str(ret));
 		return ((gfp_t) state_error);
 	}
-	if (is.fifo_ths) {
+	if (is.fifo_full) {
+		stats.fifo_full_cnt++;
+	}
+	if (is.fifo_ths || is.fifo_full) {
 		int frame_count;
 		if ((ret = icm_45686_get_frame_count(icm, &frame_count))) {
 			msg(INF, "ICM45686: get_frame_count() error (%s)\n", hwerr_str(ret));
 			return ((gfp_t) state_error);
+		}
+		if ((unsigned int) frame_count > stats.max_fifo_backlog) {
+			stats.max_fifo_backlog = frame_count;
 		}
 		if (!frame_count) {
 			stats.fifo_empty_err_cnt++;
@@ -284,11 +370,23 @@ static gfp_t wait_intr(void)
 static gfp_t ping_icm(void)
 {
 	int ret;
+	int frame_count;
 
 	ret = icm_45686_whoami_check(icm);
 	if (ret) {
 		msg(INF, "ICM45686: ping_icm() error (%s)\n", hwerr_str(ret));
 		return ((gfp_t) state_error);
+	}
+	ret = icm_45686_get_frame_count(icm, &frame_count);
+	if (ret) {
+		msg(INF, "ICM45686: ping_icm() diagnostic FIFO_COUNT error (%s)\n", hwerr_str(ret));
+	} else {
+		if (frame_count > 0) {
+			stats.timeout_fifo_nonempty_cnt++;
+		}
+		if ((unsigned int) frame_count > stats.max_fifo_backlog) {
+			stats.max_fifo_backlog = frame_count;
+		}
 	}
 	return ((gfp_t) wait_intr);
 }
@@ -299,6 +397,7 @@ static gfp_t ping_icm(void)
 static BaseType_t int1_isr_clbk(uint32_t status)
 {
 	BaseType_t tsk_wkn = pdFALSE;
+
 #if ICM45686_INTR_TYPE == LOW_LEVEL_INTR_TYPE
 	if (status & ICM45686_INT1_PIN &&
 	    gpio_hal_is_intr_enabled(ICM45686_INT1_CONT, ICM45686_INT1_PIN) &&
@@ -307,13 +406,15 @@ static BaseType_t int1_isr_clbk(uint32_t status)
 		xSemaphoreGiveFromISR(isr_sig, &tsk_wkn);
 	}
 #elif ICM45686_INTR_TYPE == FALL_EDGE_INTR_TYPE
-	if (status & ICM45686_INT1_PIN && gpio_hal_is_intr_enabled(ICM45686_INT1_CONT, ICM45686_INT1_PIN) &&
-	    gpio_hal_get_input(ICM45686_INT1_CONT, ICM45686_INT1_PIN) == GPIO_HAL_LOW) {
+	if (status & ICM45686_INT1_PIN && gpio_hal_is_intr_enabled(ICM45686_INT1_CONT, ICM45686_INT1_PIN)) {
+		if (gpio_hal_get_input(ICM45686_INT1_CONT, ICM45686_INT1_PIN) == GPIO_HAL_HIGH) {
+			stats.irq_pin_high_cnt++;
+		}
 		gpio_hal_intr_disable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
 		xSemaphoreGiveFromISR(isr_sig, &tsk_wkn);
 	}
 #else
- #error "ICM45686_INTR_TYPE unknown"
+#error "ICM45686_INTR_TYPE unknown"
 #endif
 	return (tsk_wkn);
 }
@@ -340,11 +441,50 @@ static void tsk(void *p)
 	}
 }
 
+#if ICM45686_REPORT_FN == 1 && \
+    (ICM45686_REPORT_FIFO_TMSTMP != 0 || ICM45686_REPORT_ACCEL_SI != 0 || \
+     ICM45686_REPORT_GYRO_SI != 0 || ICM45686_REPORT_ACCEL_LSB != 0 || \
+     ICM45686_REPORT_GYRO_LSB != 0)
+/**
+ * report_line
+ */
+static void report_line(unsigned int dest, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	if (!(dest & ICM45686_REPORT_TO_MSG) && (!(dest & ICM45686_REPORT_TO_CALLBACK) || report_clbk == NULL)) {
+		return;
+	}
+	va_start(ap, fmt);
+	n = vsnprintf(report_buf, ICM45686_REPORT_BUF_SIZE, fmt, ap);
+	va_end(ap);
+	if (n < 0 || (size_t) n >= ICM45686_REPORT_BUF_SIZE) {
+		msg(INF, "ICM45686: report_line() formatting error\n");
+		return;
+	}
+	if (dest & ICM45686_REPORT_TO_MSG) {
+		msg(INF, "%s", report_buf);
+	}
+	if ((dest & ICM45686_REPORT_TO_CALLBACK) && report_clbk != NULL && !report_clbk(report_buf)) {
+		stats.report_fn_err_cnt++;
+	}
+}
+#elif ICM45686_REPORT_FN == 0
+#define report_line(dest, ...) msg(INF, __VA_ARGS__)
+#endif
+
 /**
  * report_data
  */
 static void report_data(union icm_45686_fifo_frame *frame)
 {
+#if ICM45686_REPORT_MSG_NUM == 1 && \
+    (ICM45686_REPORT_FIFO_TMSTMP != 0 || ICM45686_REPORT_ACCEL_SI != 0 || \
+     ICM45686_REPORT_GYRO_SI != 0 || ICM45686_REPORT_ACCEL_LSB != 0 || \
+     ICM45686_REPORT_GYRO_LSB != 0)
+	static unsigned int msg_num;
+#endif
 	__attribute__((unused)) boolean_t accel_data_valid = FALSE;
 	__attribute__((unused)) boolean_t gyro_data_valid = FALSE;
 	__attribute__((unused)) boolean_t temp_data_valid = FALSE;
@@ -366,6 +506,7 @@ static void report_data(union icm_45686_fifo_frame *frame)
 	int gyro_fsr_dps = 2000;
 	int temp_scale_factor = 2;
 #endif
+
 #if ICM45686_FIFO_HIRES == 1
 	accel_raw[0] = frame->byte_20.accel_data[0];
 	accel_raw[1] = frame->byte_20.accel_data[1];
@@ -384,7 +525,7 @@ static void report_data(union icm_45686_fifo_frame *frame)
 		gyro_data_valid = TRUE;
 	}
 	temp_raw = frame->byte_20.temp_data;
-	if (temp_raw >> 4 != ICM_45686_INVALID_VALUE_FIFO_1B) {
+	if (temp_raw != ICM_45686_INVALID_VALUE_FIFO) {
 		temp_data_valid = TRUE;
 	}
 	fifo_timestamp = frame->byte_20.timestamp;
@@ -411,6 +552,28 @@ static void report_data(union icm_45686_fifo_frame *frame)
 	}
 	fifo_timestamp = frame->byte_16.timestamp;
 #endif
+#if ICM45686_REPORT_SAMPLE_FN == 1
+	if (sample_clbk != NULL) {
+		struct icm45686_fifo_sample sample;
+		for (int i = 0; i < 3; i++) {
+			sample.accel_raw[i] = accel_raw[i];
+			sample.gyro_raw[i] = gyro_raw[i];
+		}
+		sample.temp_raw = temp_raw;
+		sample.timestamp = fifo_timestamp;
+		sample.accel_valid = accel_data_valid;
+		sample.gyro_valid = gyro_data_valid;
+		sample.temp_valid = temp_data_valid;
+#if ICM45686_FIFO_HIRES == 1
+		sample.data_bits = 20;
+#else
+		sample.data_bits = 16;
+#endif
+		if (!sample_clbk(&sample)) {
+			stats.sample_fn_err_cnt++;
+		}
+	}
+#endif
 	accel_g[0] = (float) (accel_raw[0] * accel_fsr_g) / max_lsb;
 	accel_g[1] = (float) (accel_raw[1] * accel_fsr_g) / max_lsb;
 	accel_g[2] = (float) (accel_raw[2] * accel_fsr_g) / max_lsb;
@@ -418,43 +581,62 @@ static void report_data(union icm_45686_fifo_frame *frame)
 	gyro_dps[1] = (float) (gyro_raw[1] * gyro_fsr_dps) / max_lsb;
 	gyro_dps[2] = (float) (gyro_raw[2] * gyro_fsr_dps) / max_lsb;
 	temp_degc = (float) 25 + ((float) temp_raw / temp_scale_factor);
-#if ICM45686_REPORT_FIFO_TMSTMP == 1
+#if ICM45686_REPORT_FIFO_TMSTMP != 0
 	if (temp_data_valid) {
-		msg(INF, "ICM45686 FIFO Timestamp: %5hu us Temp: % 6.2f degC\n", fifo_timestamp, temp_degc);
+		ICM45686_REPORT_NUM_LINE_ARGS(ICM45686_REPORT_FIFO_TMSTMP,
+		    "ICM45686 FIFO Timestamp" ICM45686_REPORT_NUM_FMT ": %5hu us Temp: % 6.2f degC\n",
+		    fifo_timestamp, temp_degc);
 	} else {
-		msg(INF, "ICM45686 FIFO Timestamp: %5hu us\n", fifo_timestamp);
+		ICM45686_REPORT_NUM_LINE_ARGS(ICM45686_REPORT_FIFO_TMSTMP,
+		    "ICM45686 FIFO Timestamp" ICM45686_REPORT_NUM_FMT ": %5hu us\n", fifo_timestamp);
 	}
 #endif
-#if ICM45686_REPORT_ACCEL_SI == 1
+#if ICM45686_REPORT_ACCEL_SI != 0
 	if (accel_data_valid) {
-		msg(INF, "ICM45686 Accel: % 8.2f % 8.2f % 8.2f g\n",
+		ICM45686_REPORT_NUM_LINE_ARGS(ICM45686_REPORT_ACCEL_SI,
+		    "ICM45686 Accel" ICM45686_REPORT_NUM_FMT ": % 8.2f % 8.2f % 8.2f g\n",
 		    accel_g[0], accel_g[1], accel_g[2]);
 	} else {
-		msg(INF, "ICM45686 Accel: -- invalid data --\n");
+		ICM45686_REPORT_NUM_LINE(ICM45686_REPORT_ACCEL_SI,
+		    "ICM45686 Accel" ICM45686_REPORT_NUM_FMT ": -- invalid data --\n");
 	}
 #endif
-#if ICM45686_REPORT_GYRO_SI == 1
+#if ICM45686_REPORT_GYRO_SI != 0
 	if (gyro_data_valid) {
-		msg(INF, "ICM45686  Gyro: % 8.2f % 8.2f % 8.2f dps\n",
+		ICM45686_REPORT_NUM_LINE_ARGS(ICM45686_REPORT_GYRO_SI,
+		    "ICM45686  Gyro" ICM45686_REPORT_NUM_FMT ": % 8.2f % 8.2f % 8.2f dps\n",
 		    gyro_dps[0], gyro_dps[1], gyro_dps[2]);
 	} else {
-		msg(INF, "ICM45686  Gyro: -- invalid data --\n");
+		ICM45686_REPORT_NUM_LINE(ICM45686_REPORT_GYRO_SI,
+		    "ICM45686  Gyro" ICM45686_REPORT_NUM_FMT ": -- invalid data --\n");
 	}
 #endif
-#if ICM45686_REPORT_ACCEL_LSB == 1
+#if ICM45686_REPORT_ACCEL_LSB != 0
 	if (accel_data_valid) {
-		msg(INF, "ICM45686 Accel: %+09d %+09d %+09d\n",
+		ICM45686_REPORT_NUM_LINE_ARGS(ICM45686_REPORT_ACCEL_LSB,
+		    "ICM45686 Accel" ICM45686_REPORT_NUM_FMT ": %+09d %+09d %+09d\n",
 		    accel_raw[0], accel_raw[1], accel_raw[2]);
 	} else {
-		msg(INF, "ICM45686 Accel: -- invalid data --\n");
+		ICM45686_REPORT_NUM_LINE(ICM45686_REPORT_ACCEL_LSB,
+		    "ICM45686 Accel" ICM45686_REPORT_NUM_FMT ": -- invalid data --\n");
 	}
 #endif
-#if ICM45686_REPORT_GYRO_LSB == 1
+#if ICM45686_REPORT_GYRO_LSB != 0
 	if (gyro_data_valid) {
-		msg(INF, "ICM45686  Gyro: %+09d %+09d %+09d\n",
+		ICM45686_REPORT_NUM_LINE_ARGS(ICM45686_REPORT_GYRO_LSB,
+		    "ICM45686  Gyro" ICM45686_REPORT_NUM_FMT ": %+09d %+09d %+09d\n",
 		    gyro_raw[0], gyro_raw[1], gyro_raw[2]);
 	} else {
-		msg(INF, "ICM45686  Gyro: -- invalid data --\n");
+		ICM45686_REPORT_NUM_LINE(ICM45686_REPORT_GYRO_LSB,
+		    "ICM45686  Gyro" ICM45686_REPORT_NUM_FMT ": -- invalid data --\n");
+	}
+#endif
+#if ICM45686_REPORT_MSG_NUM == 1 && \
+    (ICM45686_REPORT_FIFO_TMSTMP != 0 || ICM45686_REPORT_ACCEL_SI != 0 || \
+     ICM45686_REPORT_GYRO_SI != 0 || ICM45686_REPORT_ACCEL_LSB != 0 || \
+     ICM45686_REPORT_GYRO_LSB != 0)
+	if (++msg_num > 999) {
+		msg_num = 0;
 	}
 #endif
 }
@@ -469,10 +651,18 @@ static void cmd_icms(void)
 	pr = uxTaskPriorityGet(NULL);
 	vTaskPrioritySet(NULL, TASK_PRIO_HIGH);
 	msg(INF, cmd_accp);
-	msg(INF, "ICM45686 cnt: read_frame_cnt=%u unknown_intr=%u\n",
-	    stats.read_frame_cnt, stats.unknown_intr_cnt);
+	msg(INF, "ICM45686 cnt: read_frame_cnt=%u fifo_full=%u unknown_intr=%u\n",
+	    stats.read_frame_cnt, stats.fifo_full_cnt, stats.unknown_intr_cnt);
 	msg(INF, "ICM45686 cnt: fifo_empty_err=%u stm_rst=%u\n",
 	    stats.fifo_empty_err_cnt, stats.stm_rst_cnt);
+	msg(INF, "ICM45686 cnt: irq_pin_high=%u timeout_fifo_nonempty=%u max_fifo_backlog=%u\n",
+	    stats.irq_pin_high_cnt, stats.timeout_fifo_nonempty_cnt, stats.max_fifo_backlog);
+#if ICM45686_REPORT_FN == 1
+	msg(INF, "ICM45686 cnt: report_fn_err=%u\n", stats.report_fn_err_cnt);
+#endif
+#if ICM45686_REPORT_SAMPLE_FN == 1
+	msg(INF, "ICM45686 cnt: sample_fn_err=%u\n", stats.sample_fn_err_cnt);
+#endif
 	vTaskPrioritySet(NULL, pr);
 }
 #endif

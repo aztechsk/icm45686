@@ -10,6 +10,7 @@
 #include <semphr.h>
 #include <queue.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <gentyp.h>
 #include "sysconf.h"
@@ -25,21 +26,68 @@
 #include "icm45686.h"
 #include "icm45686_stm_regs.h"
 
+#ifndef ICM45686_SENSOR_MODE
+#error "ICM45686_SENSOR_MODE not defined; define it in sysconf.h"
+#endif
+#ifndef ICM45686_REGS_MODE
+#error "ICM45686_REGS_MODE not defined; define it in sysconf.h"
+#endif
+
 #if ICM45686_SENSOR_MODE == ICM45686_REGS_MODE
 
 #define RESET_STM_TMO_MS 5000
 #define WAIT_ISR_SIG_TMO_MS 50
+#define ICM45686_REPORT_TO_MSG 1U
+#define ICM45686_REPORT_TO_CALLBACK 2U
+
+#if ICM45686_REPORT_MSG_NUM == 1
+#define ICM45686_REPORT_NUM_FMT " [%03u]"
+#define ICM45686_REPORT_NUM_LINE_ARGS(dest, fmt, ...) report_line((dest), (fmt), msg_num, __VA_ARGS__)
+#else
+#define ICM45686_REPORT_NUM_FMT ""
+#define ICM45686_REPORT_NUM_LINE_ARGS(dest, fmt, ...) report_line((dest), (fmt), __VA_ARGS__)
+#endif
+
+#if ICM45686_REPORT_ACCEL_SI < 0 || ICM45686_REPORT_ACCEL_SI > 3 || \
+    ICM45686_REPORT_GYRO_SI < 0 || ICM45686_REPORT_GYRO_SI > 3 || \
+    ICM45686_REPORT_ACCEL_LSB < 0 || ICM45686_REPORT_ACCEL_LSB > 3 || \
+    ICM45686_REPORT_GYRO_LSB < 0 || ICM45686_REPORT_GYRO_LSB > 3
+#error "ICM45686_REPORT_* values must be 0 (off), 1 (msg), 2 (callback), or 3 (both)"
+#endif
+#if ICM45686_REPORT_FN == 0 && \
+    ((ICM45686_REPORT_ACCEL_SI & 2) || (ICM45686_REPORT_GYRO_SI & 2) || \
+     (ICM45686_REPORT_ACCEL_LSB & 2) || (ICM45686_REPORT_GYRO_LSB & 2))
+#error "ICM45686_REPORT_FN must be 1 when a text report is routed to the callback"
+#endif
+
+#if ICM45686_REPORT_FN == 1
+#define ICM45686_REPORT_BUF_SIZE 192U
+#endif
 
 static TaskHandle_t tsk_hndl;
 static struct icm_45686_dsc icm_45686_dsc;
 static icm_45686 icm = &icm_45686_dsc;
 static p_stf_t stmf;
 static SemaphoreHandle_t isr_sig;
+#if ICM45686_REPORT_FN == 1
+static boolean_t (*report_clbk)(const char *);
+static char *report_buf;
+#endif
+#if ICM45686_REPORT_SAMPLE_FN == 1
+static boolean_t (*sample_clbk)(const struct icm_45686_sensor_data *);
+#endif
 
 static struct {
 	unsigned int read_data_reg_cnt;
 	unsigned int unknown_intr_cnt;
+	unsigned int drdy_timeout_cnt;
 	unsigned int stm_rst_cnt;
+#if ICM45686_REPORT_FN == 1
+	unsigned int report_fn_err_cnt;
+#endif
+#if ICM45686_REPORT_SAMPLE_FN == 1
+	unsigned int sample_fn_err_cnt;
+#endif
 } stats;
 
 static gfp_t state_sw_reset(void);
@@ -71,15 +119,40 @@ void init_icm45686_stm_regs(void)
 	icm->spi.cfg.csel_cont = gpio_hal_get_ctrl(ICM45686_CS_CONT_ID);
 	icm->spi.cfg.csel_pin = ICM45686_CS_PIN_ID;
 	init_icm_45686(icm);
-	if (NULL == (isr_sig = xSemaphoreCreateBinary())) {
+#if ICM45686_REPORT_FN == 1
+	if ((report_buf = pvPortMalloc(ICM45686_REPORT_BUF_SIZE)) == NULL) {
+		crit_err_exit(MALLOC_ERROR);
+	}
+#endif
+	if ((isr_sig = xSemaphoreCreateBinary()) == NULL) {
 		crit_err_exit(MALLOC_ERROR);
 	}
 	add_command_noargs("icms", cmd_icms);
-        if (pdPASS != xTaskCreate(tsk, "ICM45686", ICM45686_TASK_STACK_SIZE, NULL,
-                                  ICM45686_TASK_PRIO, &tsk_hndl)) {
-                crit_err_exit(MALLOC_ERROR);
-        }
+	if (xTaskCreate(tsk, "ICM45686", ICM45686_TASK_STACK_SIZE, NULL,
+			ICM45686_TASK_PRIO, &tsk_hndl) != pdPASS) {
+		crit_err_exit(MALLOC_ERROR);
+	}
 }
+
+#if ICM45686_REPORT_FN == 1
+/**
+ * icm45686_stm_set_report_fn
+ */
+void icm45686_stm_set_report_fn(boolean_t (*report_fn)(const char *))
+{
+	report_clbk = report_fn;
+}
+#endif
+
+#if ICM45686_REPORT_SAMPLE_FN == 1
+/**
+ * icm45686_stm_set_sample_fn
+ */
+void icm45686_stm_set_sample_fn(boolean_t (*sample_fn)(const struct icm_45686_sensor_data *))
+{
+	sample_clbk = sample_fn;
+}
+#endif
 
 /**
  * state_sw_reset
@@ -88,6 +161,7 @@ static gfp_t state_sw_reset(void)
 {
 	int ret;
 
+	gpio_hal_intr_disable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
 	ret = icm_45686_soft_reset(icm);
 	if (ret) {
 		msg(INF, "ICM45686: Soft reset error (%s)\n", hwerr_str(ret));
@@ -148,13 +222,9 @@ static gfp_t intr_cfg(void)
 	pin_cfg.mode = ICM_45686_INT1_CONFIG2_MODE_PULSE;
 	pin_cfg.drive = ICM_45686_INT1_CONFIG2_DRIVE_PP;
 #else
- #error "ICM45686_INTR_TYPE unknown"
+#error "ICM45686_INTR_TYPE unknown"
 #endif
 	if ((ret = icm_45686_set_config_int_pin(icm, ICM_45686_INT1, &pin_cfg))) {
-		goto err;
-	}
-	int_cfg.ui_drdy = ICM_45686_ENABLE;
-	if ((ret = icm_45686_set_config_int_source(icm, ICM_45686_INT1, &int_cfg))) {
 		goto err;
 	}
 	if ((ret = icm_45686_get_int_status(icm, ICM_45686_INT1, &int_cfg))) {
@@ -169,12 +239,11 @@ static gfp_t intr_cfg(void)
 #elif ICM45686_INTR_TYPE == FALL_EDGE_INTR_TYPE
 	gpio_hal_intr_config(ICM45686_INT1_CONT, ICM45686_INT1_PIN, GPIO_HAL_INTR_FALLING);
 #else
- #error "ICM45686_INTR_TYPE unknown"
+#error "ICM45686_INTR_TYPE unknown"
 #endif
 	if (!gpio_hal_isr_registered(ICM45686_INT1_CONT, int1_isr_clbk)) {
 		gpio_hal_isr_register(ICM45686_INT1_CONT, int1_isr_clbk);
 	}
-	gpio_hal_intr_enable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
 	return ((gfp_t) accel_gyro_cfg);
 err:
 	msg(INF, "ICM45686: intr_cfg() error (%s)\n", hwerr_str(ret));
@@ -187,6 +256,8 @@ err:
 static gfp_t accel_gyro_cfg(void)
 {
 	int ret;
+	struct icm_45686_int_bitmap int_cfg = {0};
+	struct icm_45686_int_bitmap is;
 
 	if ((ret = icm_45686_set_accel_fsr(icm, ICM_45686_ACCEL_CONFIG0_UI_FS_SEL_4_G))) {
 		goto err;
@@ -215,6 +286,17 @@ static gfp_t accel_gyro_cfg(void)
 	if ((ret = icm_45686_select_accel_lp_clk(icm, ICM_45686_SMC_CONTROL_0_ACCEL_LP_CLK_RCOSC))) {
 		goto err;
 	}
+	/* Route DATA_READY to INT1 only after the gyroscope has started up. */
+	vTaskDelay(ms_to_os_ticks((ICM_45686_GYR_STARTUP_TIME_US + 999) / 1000) + 1);
+	if ((ret = icm_45686_get_int_status(icm, ICM_45686_INT1, &is))) {
+		goto err;
+	}
+	(void) xSemaphoreTake(isr_sig, 0);
+	int_cfg.ui_drdy = ICM_45686_ENABLE;
+	if ((ret = icm_45686_set_config_int_source(icm, ICM_45686_INT1, &int_cfg))) {
+		goto err;
+	}
+	gpio_hal_intr_enable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
 	return ((gfp_t) wait_intr);
 err:
 	msg(INF, "ICM45686: accel_gyro_cfg() error (%s)\n", hwerr_str(ret));
@@ -230,7 +312,8 @@ static gfp_t wait_intr(void)
 	struct icm_45686_sensor_data sd;
 	struct icm_45686_int_bitmap is;
 
-	if (pdFALSE == xSemaphoreTake(isr_sig, ms_to_os_ticks(WAIT_ISR_SIG_TMO_MS))) {
+	if (xSemaphoreTake(isr_sig, ms_to_os_ticks(WAIT_ISR_SIG_TMO_MS)) == pdFALSE) {
+		stats.drdy_timeout_cnt++;
 		return ((gfp_t) ping_icm);
 	}
 	if ((ret = icm_45686_get_int_status(icm, ICM_45686_INT1, &is))) {
@@ -243,8 +326,9 @@ static gfp_t wait_intr(void)
 			return ((gfp_t) state_error);
 		}
 		stats.read_data_reg_cnt++;
-#if ICM45686_REPORT_ACCEL_SI == 1 || ICM45686_REPORT_GYRO_SI == 1 ||\
-    ICM45686_REPORT_ACCEL_LSB == 1 || ICM45686_REPORT_GYRO_LSB == 1
+#if ICM45686_REPORT_SAMPLE_FN == 1 || ICM45686_REPORT_ACCEL_SI != 0 || \
+    ICM45686_REPORT_GYRO_SI != 0 || ICM45686_REPORT_ACCEL_LSB != 0 || \
+    ICM45686_REPORT_GYRO_LSB != 0
 		report_data(&sd);
 #endif
 	} else {
@@ -275,6 +359,7 @@ static gfp_t ping_icm(void)
 static BaseType_t int1_isr_clbk(uint32_t status)
 {
 	BaseType_t tsk_wkn = pdFALSE;
+
 #if ICM45686_INTR_TYPE == LOW_LEVEL_INTR_TYPE
 	if (status & ICM45686_INT1_PIN &&
 	    gpio_hal_is_intr_enabled(ICM45686_INT1_CONT, ICM45686_INT1_PIN) &&
@@ -288,7 +373,7 @@ static BaseType_t int1_isr_clbk(uint32_t status)
 		xSemaphoreGiveFromISR(isr_sig, &tsk_wkn);
 	}
 #else
- #error "ICM45686_INTR_TYPE unknown"
+#error "ICM45686_INTR_TYPE unknown"
 #endif
 	return (tsk_wkn);
 }
@@ -315,42 +400,95 @@ static void tsk(void *p)
 	}
 }
 
+#if ICM45686_REPORT_FN == 1 && \
+    (ICM45686_REPORT_ACCEL_SI != 0 || ICM45686_REPORT_GYRO_SI != 0 || \
+     ICM45686_REPORT_ACCEL_LSB != 0 || ICM45686_REPORT_GYRO_LSB != 0)
+/**
+ * report_line
+ */
+static void report_line(unsigned int dest, const char *fmt, ...)
+{
+	va_list ap;
+	int n;
+
+	if (!(dest & ICM45686_REPORT_TO_MSG) && (!(dest & ICM45686_REPORT_TO_CALLBACK) || report_clbk == NULL)) {
+		return;
+	}
+	va_start(ap, fmt);
+	n = vsnprintf(report_buf, ICM45686_REPORT_BUF_SIZE, fmt, ap);
+	va_end(ap);
+	if (n < 0 || (size_t) n >= ICM45686_REPORT_BUF_SIZE) {
+		msg(INF, "ICM45686: report_line() formatting error\n");
+		return;
+	}
+	if (dest & ICM45686_REPORT_TO_MSG) {
+		msg(INF, "%s", report_buf);
+	}
+	if ((dest & ICM45686_REPORT_TO_CALLBACK) && report_clbk != NULL && !report_clbk(report_buf)) {
+		stats.report_fn_err_cnt++;
+	}
+}
+#elif ICM45686_REPORT_FN == 0
+#define report_line(dest, ...) msg(INF, __VA_ARGS__)
+#endif
+
 /**
  * report_data
- *
- * SI units:
- * FSR - 4 g and 2000 dps (16-bits signed, max_lsb = 2^(16-1) = 32768).
- * Temp - 16-bits signed with scale factor of 128 and offset of 25 C.
  */
 static void report_data(struct icm_45686_sensor_data *sd)
 {
-#if ICM45686_REPORT_ACCEL_SI == 1 || ICM45686_REPORT_GYRO_SI == 1
+#if ICM45686_REPORT_MSG_NUM == 1 && \
+    (ICM45686_REPORT_ACCEL_SI != 0 || ICM45686_REPORT_GYRO_SI != 0 || \
+     ICM45686_REPORT_ACCEL_LSB != 0 || ICM45686_REPORT_GYRO_LSB != 0)
+	static unsigned int msg_num;
+#endif
+#if ICM45686_REPORT_SAMPLE_FN == 1
+	if (sample_clbk != NULL && !sample_clbk(sd)) {
+		stats.sample_fn_err_cnt++;
+	}
+#endif
+#if ICM45686_REPORT_ACCEL_SI != 0 || ICM45686_REPORT_GYRO_SI != 0
 	float temp_degc;
+
+	/* Temperature: 25 degC + raw / 128 LSB/degC. */
 	temp_degc = (float) 25 + ((float) sd->temp_data / 128);
 #endif
-#if ICM45686_REPORT_ACCEL_SI == 1
+#if ICM45686_REPORT_ACCEL_SI != 0
+	/* Conversion assumes signed 16-bit samples at accelerometer FSR +/-4 g. */
 	float accel_g[3];
 	accel_g[0] = (float) (sd->accel_data[0] * 4) / 32768;
 	accel_g[1] = (float) (sd->accel_data[1] * 4) / 32768;
 	accel_g[2] = (float) (sd->accel_data[2] * 4) / 32768;
-	msg(INF, "ICM45686 Accel: % 8.2f % 8.2f % 8.2f g   % 6.2f degC\n",
+	ICM45686_REPORT_NUM_LINE_ARGS(ICM45686_REPORT_ACCEL_SI,
+	    "ICM45686 Accel" ICM45686_REPORT_NUM_FMT ": % 8.2f % 8.2f % 8.2f g   % 6.2f degC\n",
 	    accel_g[0], accel_g[1], accel_g[2], temp_degc);
 #endif
-#if ICM45686_REPORT_GYRO_SI == 1
+#if ICM45686_REPORT_GYRO_SI != 0
+	/* Conversion assumes signed 16-bit samples at gyroscope FSR +/-2000 dps. */
 	float gyro_dps[3];
 	gyro_dps[0] = (float) (sd->gyro_data[0] * 2000) / 32768;
 	gyro_dps[1] = (float) (sd->gyro_data[1] * 2000) / 32768;
 	gyro_dps[2] = (float) (sd->gyro_data[2] * 2000) / 32768;
-	msg(INF, "ICM45686  Gyro: % 8.2f % 8.2f % 8.2f dps % 6.2f degC\n",
+	ICM45686_REPORT_NUM_LINE_ARGS(ICM45686_REPORT_GYRO_SI,
+	    "ICM45686  Gyro" ICM45686_REPORT_NUM_FMT ": % 8.2f % 8.2f % 8.2f dps % 6.2f degC\n",
 	    gyro_dps[0], gyro_dps[1], gyro_dps[2], temp_degc);
 #endif
-#if ICM45686_REPORT_ACCEL_LSB == 1
-	msg(INF, "ICM45686 Accel: %+09d %+09d %+09d Temp: %+07d\n",
+#if ICM45686_REPORT_ACCEL_LSB != 0
+	ICM45686_REPORT_NUM_LINE_ARGS(ICM45686_REPORT_ACCEL_LSB,
+	    "ICM45686 Accel" ICM45686_REPORT_NUM_FMT ": %+09d %+09d %+09d Temp: %+07d\n",
 	    (int) sd->accel_data[0], (int) sd->accel_data[1], (int) sd->accel_data[2], (int) sd->temp_data);
 #endif
-#if ICM45686_REPORT_GYRO_LSB == 1
-	msg(INF, "ICM45686  Gyro: %+09d %+09d %+09d Temp: %+07d\n",
+#if ICM45686_REPORT_GYRO_LSB != 0
+	ICM45686_REPORT_NUM_LINE_ARGS(ICM45686_REPORT_GYRO_LSB,
+	    "ICM45686  Gyro" ICM45686_REPORT_NUM_FMT ": %+09d %+09d %+09d Temp: %+07d\n",
 	    (int) sd->gyro_data[0], (int) sd->gyro_data[1], (int) sd->gyro_data[2], (int) sd->temp_data);
+#endif
+#if ICM45686_REPORT_MSG_NUM == 1 && \
+    (ICM45686_REPORT_ACCEL_SI != 0 || ICM45686_REPORT_GYRO_SI != 0 || \
+     ICM45686_REPORT_ACCEL_LSB != 0 || ICM45686_REPORT_GYRO_LSB != 0)
+	if (++msg_num == 1000) {
+		msg_num = 0;
+	}
 #endif
 }
 
@@ -364,8 +502,14 @@ static void cmd_icms(void)
 	pr = uxTaskPriorityGet(NULL);
 	vTaskPrioritySet(NULL, TASK_PRIO_HIGH);
 	msg(INF, cmd_accp);
-	msg(INF, "ICM45686 cnt: read_data_reg=%u unknown_intr=%u stm_rst=%u\n",
-	    stats.read_data_reg_cnt, stats.unknown_intr_cnt, stats.stm_rst_cnt);
+	msg(INF, "ICM45686 cnt: read_data_reg=%u unknown_intr=%u drdy_timeout=%u stm_rst=%u\n",
+	    stats.read_data_reg_cnt, stats.unknown_intr_cnt, stats.drdy_timeout_cnt, stats.stm_rst_cnt);
+#if ICM45686_REPORT_FN == 1
+	msg(INF, "ICM45686 cnt: report_fn_err=%u\n", stats.report_fn_err_cnt);
+#endif
+#if ICM45686_REPORT_SAMPLE_FN == 1
+	msg(INF, "ICM45686 cnt: sample_fn_err=%u\n", stats.sample_fn_err_cnt);
+#endif
 	vTaskPrioritySet(NULL, pr);
 }
 #endif
