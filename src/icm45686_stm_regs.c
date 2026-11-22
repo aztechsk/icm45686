@@ -37,6 +37,7 @@
 
 #define RESET_STM_TMO_MS 5000
 #define WAIT_ISR_SIG_TMO_MS 50
+#define NO_DRDY_TMO_MS 1000U
 #define ICM45686_REPORT_TO_MSG 1U
 #define ICM45686_REPORT_TO_CALLBACK 2U
 
@@ -69,6 +70,7 @@ static struct icm_45686_dsc icm_45686_dsc;
 static icm_45686 icm = &icm_45686_dsc;
 static p_stf_t stmf;
 static SemaphoreHandle_t isr_sig;
+static TickType_t last_data_tick;
 #if ICM45686_REPORT_FN == 1
 static boolean_t (*report_clbk)(const char *);
 static char *report_buf;
@@ -81,6 +83,7 @@ static struct {
 	unsigned int read_data_reg_cnt;
 	unsigned int unknown_intr_cnt;
 	unsigned int drdy_timeout_cnt;
+	unsigned int no_data_reset_cnt;
 	unsigned int stm_rst_cnt;
 #if ICM45686_REPORT_FN == 1
 	unsigned int report_fn_err_cnt;
@@ -97,6 +100,7 @@ static gfp_t intr_cfg(void);
 static gfp_t accel_gyro_cfg(void);
 static gfp_t wait_intr(void);
 static gfp_t ping_icm(void);
+static gfp_t check_progress(void);
 static BaseType_t int1_isr_clbk(uint32_t status);
 static gfp_t state_error(void);
 static void tsk(void *p);
@@ -296,6 +300,7 @@ static gfp_t accel_gyro_cfg(void)
 	if ((ret = icm_45686_set_config_int_source(icm, ICM_45686_INT1, &int_cfg))) {
 		goto err;
 	}
+	last_data_tick = xTaskGetTickCount();
 	gpio_hal_intr_enable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
 	return ((gfp_t) wait_intr);
 err:
@@ -326,6 +331,7 @@ static gfp_t wait_intr(void)
 			return ((gfp_t) state_error);
 		}
 		stats.read_data_reg_cnt++;
+		last_data_tick = xTaskGetTickCount();
 #if ICM45686_REPORT_SAMPLE_FN == 1 || ICM45686_REPORT_ACCEL_SI != 0 || \
     ICM45686_REPORT_GYRO_SI != 0 || ICM45686_REPORT_ACCEL_LSB != 0 || \
     ICM45686_REPORT_GYRO_LSB != 0
@@ -335,7 +341,7 @@ static gfp_t wait_intr(void)
 		stats.unknown_intr_cnt++;
 	}
 	gpio_hal_intr_enable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
-	return ((gfp_t) wait_intr);
+	return (check_progress());
 }
 
 /**
@@ -348,6 +354,19 @@ static gfp_t ping_icm(void)
 	ret = icm_45686_whoami_check(icm);
 	if (ret) {
 		msg(INF, "ICM45686: ping_icm() error (%s)\n", hwerr_str(ret));
+		return ((gfp_t) state_error);
+	}
+	return (check_progress());
+}
+
+/**
+ * check_progress
+ */
+static gfp_t check_progress(void)
+{
+	if ((TickType_t) (xTaskGetTickCount() - last_data_tick) >= ms_to_os_ticks(NO_DRDY_TMO_MS)) {
+		stats.no_data_reset_cnt++;
+		msg(INF, "ICM45686: no data-ready samples for %u ms, restarting STM\n", NO_DRDY_TMO_MS);
 		return ((gfp_t) state_error);
 	}
 	return ((gfp_t) wait_intr);
@@ -383,6 +402,7 @@ static BaseType_t int1_isr_clbk(uint32_t status)
  */
 static gfp_t state_error(void)
 {
+	gpio_hal_intr_disable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
 	msg(INF, "ICM45686: resetting state machine after error\n");
 	vTaskDelay(ms_to_os_ticks(RESET_STM_TMO_MS));
 	stats.stm_rst_cnt++;
@@ -502,8 +522,9 @@ static void cmd_icms(void)
 	pr = uxTaskPriorityGet(NULL);
 	vTaskPrioritySet(NULL, TASK_PRIO_HIGH);
 	msg(INF, cmd_accp);
-	msg(INF, "ICM45686 cnt: read_data_reg=%u unknown_intr=%u drdy_timeout=%u stm_rst=%u\n",
-	    stats.read_data_reg_cnt, stats.unknown_intr_cnt, stats.drdy_timeout_cnt, stats.stm_rst_cnt);
+	msg(INF, "ICM45686 cnt: read_data_reg=%u unknown_intr=%u drdy_timeout=%u no_data_reset=%u stm_rst=%u\n",
+	    stats.read_data_reg_cnt, stats.unknown_intr_cnt, stats.drdy_timeout_cnt,
+	    stats.no_data_reset_cnt, stats.stm_rst_cnt);
 #if ICM45686_REPORT_FN == 1
 	msg(INF, "ICM45686 cnt: report_fn_err=%u\n", stats.report_fn_err_cnt);
 #endif

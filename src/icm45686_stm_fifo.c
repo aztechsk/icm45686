@@ -15,6 +15,7 @@
 #include "sysconf.h"
 #include "board.h"
 #include <mmio.h>
+#include <atom.h>
 #include "msgconf.h"
 #include "criterr.h"
 #include "hwerr.h"
@@ -34,8 +35,18 @@
 
 #if ICM45686_SENSOR_MODE == ICM45686_FIFO_MODE
 
+#if ICM45686_FIFO_HIRES != 0 && ICM45686_FIFO_HIRES != 1
+#error "ICM45686_FIFO_HIRES must be 0 or 1"
+#endif
+
 #define RESET_STM_TMO_MS 5000
 #define WAIT_ISR_SIG_TMO_MS 50
+#define NO_FRAMES_TMO_MS 1000U
+#if ICM45686_FIFO_HIRES == 1
+#define FIFO_MAX_FRAMES 102
+#else
+#define FIFO_MAX_FRAMES 128
+#endif
 #define ICM45686_REPORT_TO_MSG 1U
 #define ICM45686_REPORT_TO_CALLBACK 2U
 
@@ -72,6 +83,8 @@ static struct icm_45686_dsc icm_45686_dsc;
 static icm_45686 icm = &icm_45686_dsc;
 static p_stf_t stmf;
 static SemaphoreHandle_t isr_sig;
+static volatile boolean_t irq_armed;
+static TickType_t last_frame_tick;
 #if ICM45686_REPORT_FN == 1
 static boolean_t (*report_clbk)(const char *);
 static char *report_buf;
@@ -84,7 +97,9 @@ static struct {
 	unsigned int read_frame_cnt;
 	unsigned int fifo_full_cnt;
 	volatile unsigned int irq_pin_high_cnt;
+	volatile unsigned int stale_irq_cnt;
 	unsigned int timeout_fifo_nonempty_cnt;
+	unsigned int no_data_reset_cnt;
 	unsigned int max_fifo_backlog;
 	unsigned int unknown_intr_cnt;
 	unsigned int fifo_empty_err_cnt;
@@ -104,6 +119,8 @@ static gfp_t intr_cfg(void);
 static gfp_t accel_gyro_cfg(void);
 static gfp_t wait_intr(void);
 static gfp_t ping_icm(void);
+static gfp_t read_fifo_frames(int frame_count, boolean_t fifo_full);
+static gfp_t check_progress(void);
 static BaseType_t int1_isr_clbk(uint32_t status);
 static gfp_t state_error(void);
 static void tsk(void *p);
@@ -168,6 +185,9 @@ static gfp_t state_sw_reset(void)
 {
 	int ret;
 
+	gpio_hal_intr_disable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
+	irq_armed = FALSE;
+	(void) xSemaphoreTake(isr_sig, 0);
 	ret = icm_45686_soft_reset(icm);
 	if (ret) {
 		msg(INF, "ICM45686: Soft reset error (%s)\n", hwerr_str(ret));
@@ -233,11 +253,6 @@ static gfp_t intr_cfg(void)
 	if ((ret = icm_45686_set_config_int_pin(icm, ICM_45686_INT1, &pin_cfg))) {
 		goto err;
 	}
-	int_cfg.fifo_full = ICM_45686_ENABLE;
-	int_cfg.fifo_ths = ICM_45686_ENABLE;
-	if ((ret = icm_45686_set_config_int_source(icm, ICM_45686_INT1, &int_cfg))) {
-		goto err;
-	}
 	if ((ret = icm_45686_get_int_status(icm, ICM_45686_INT1, &int_cfg))) {
 		goto err;
 	}
@@ -255,7 +270,6 @@ static gfp_t intr_cfg(void)
 	if (!gpio_hal_isr_registered(ICM45686_INT1_CONT, int1_isr_clbk)) {
 		gpio_hal_isr_register(ICM45686_INT1_CONT, int1_isr_clbk);
 	}
-	gpio_hal_intr_enable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
 	return ((gfp_t) accel_gyro_cfg);
 err:
 	msg(INF, "ICM45686: intr_cfg() error (%s)\n", hwerr_str(ret));
@@ -269,6 +283,7 @@ static gfp_t accel_gyro_cfg(void)
 {
 	int ret;
 	struct icm_45686_fifo_config fifo_config;
+	struct icm_45686_int_bitmap int_cfg = {0};
 
 	if ((ret = icm_45686_get_fifo_config(icm, &fifo_config))) {
 		goto err;
@@ -304,12 +319,22 @@ static gfp_t accel_gyro_cfg(void)
 	if ((ret = icm_45686_set_gyro_ln_bw(icm, ICM_45686_IPREG_SYS1_REG_172_GYRO_UI_LPFBW_DIV_4))) {
 		goto err;
 	}
+	/* Accept any pending PIO event; stale status is harmless in wait_intr(). */
+	irq_armed = TRUE;
+	gpio_hal_intr_enable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
+	barrier();
+	int_cfg.fifo_full = ICM_45686_ENABLE;
+	int_cfg.fifo_ths = ICM_45686_ENABLE;
+	if ((ret = icm_45686_set_config_int_source(icm, ICM_45686_INT1, &int_cfg))) {
+		goto err;
+	}
 	if ((ret = icm_45686_set_accel_mode(icm, ICM_45686_PWR_MGMT0_ACCEL_MODE_LN))) {
 		goto err;
 	}
 	if ((ret = icm_45686_set_gyro_mode(icm, ICM_45686_PWR_MGMT0_GYRO_MODE_LN))) {
 		goto err;
 	}
+	last_frame_tick = xTaskGetTickCount();
 	return ((gfp_t) wait_intr);
 err:
 	msg(INF, "ICM45686: accel_gyro_cfg() error (%s)\n", hwerr_str(ret));
@@ -322,8 +347,8 @@ err:
 static gfp_t wait_intr(void)
 {
 	int ret;
+	int frame_count;
 	struct icm_45686_int_bitmap is;
-	union icm_45686_fifo_frame frame;
 
 	if (xSemaphoreTake(isr_sig, ms_to_os_ticks(WAIT_ISR_SIG_TMO_MS)) == pdFALSE) {
 		return ((gfp_t) ping_icm);
@@ -336,32 +361,25 @@ static gfp_t wait_intr(void)
 		stats.fifo_full_cnt++;
 	}
 	if (is.fifo_ths || is.fifo_full) {
-		int frame_count;
 		if ((ret = icm_45686_get_frame_count(icm, &frame_count))) {
 			msg(INF, "ICM45686: get_frame_count() error (%s)\n", hwerr_str(ret));
 			return ((gfp_t) state_error);
 		}
-		if ((unsigned int) frame_count > stats.max_fifo_backlog) {
-			stats.max_fifo_backlog = frame_count;
+		if (frame_count < 0 || frame_count > FIFO_MAX_FRAMES) {
+			msg(INF, "ICM45686: invalid FIFO_COUNT=%d\n", frame_count);
+			return ((gfp_t) state_error);
 		}
-		if (!frame_count) {
+		if (frame_count == 0) {
 			stats.fifo_empty_err_cnt++;
-			gpio_hal_intr_enable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
-			return ((gfp_t) wait_intr);
 		}
-		for (int i = 0; i < frame_count; i++) {
-			if ((ret = icm_45686_get_fifo_frame(icm, &frame))) {
-				msg(INF, "ICM45686: get_fifo_frame() error (%s)\n", hwerr_str(ret));
-				return ((gfp_t) state_error);
-			}
-			stats.read_frame_cnt++;
-			report_data(&frame);
+		if (frame_count > 0 || is.fifo_full) {
+			return (read_fifo_frames(frame_count, is.fifo_full));
 		}
 	} else {
 		stats.unknown_intr_cnt++;
 	}
 	gpio_hal_intr_enable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
-	return ((gfp_t) wait_intr);
+	return (check_progress());
 }
 
 /**
@@ -371,22 +389,79 @@ static gfp_t ping_icm(void)
 {
 	int ret;
 	int frame_count;
+	struct icm_45686_int_bitmap is;
 
-	ret = icm_45686_whoami_check(icm);
-	if (ret) {
+	/* Serialize the timeout fallback with the normal GPIO ISR path. */
+	gpio_hal_intr_disable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
+	(void) xSemaphoreTake(isr_sig, 0);
+	if ((ret = icm_45686_whoami_check(icm))) {
 		msg(INF, "ICM45686: ping_icm() error (%s)\n", hwerr_str(ret));
 		return ((gfp_t) state_error);
 	}
-	ret = icm_45686_get_frame_count(icm, &frame_count);
-	if (ret) {
-		msg(INF, "ICM45686: ping_icm() diagnostic FIFO_COUNT error (%s)\n", hwerr_str(ret));
-	} else {
-		if (frame_count > 0) {
-			stats.timeout_fifo_nonempty_cnt++;
+	if ((ret = icm_45686_get_int_status(icm, ICM_45686_INT1, &is))) {
+		msg(INF, "ICM45686: ping_icm() get_int_status() error (%s)\n", hwerr_str(ret));
+		return ((gfp_t) state_error);
+	}
+	if (is.fifo_full) {
+		stats.fifo_full_cnt++;
+	}
+	if ((ret = icm_45686_get_frame_count(icm, &frame_count))) {
+		msg(INF, "ICM45686: ping_icm() get_frame_count() error (%s)\n", hwerr_str(ret));
+		return ((gfp_t) state_error);
+	}
+	if (frame_count < 0 || frame_count > FIFO_MAX_FRAMES) {
+		msg(INF, "ICM45686: invalid FIFO_COUNT=%d\n", frame_count);
+		return ((gfp_t) state_error);
+	}
+	if (frame_count > 0) {
+		stats.timeout_fifo_nonempty_cnt++;
+	}
+	if (frame_count > 0 || is.fifo_full) {
+		return (read_fifo_frames(frame_count, is.fifo_full));
+	}
+	gpio_hal_intr_enable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
+	return (check_progress());
+}
+
+/**
+ * read_fifo_frames
+ */
+static gfp_t read_fifo_frames(int frame_count, boolean_t fifo_full)
+{
+	int ret;
+	union icm_45686_fifo_frame frame;
+
+	if ((unsigned int) frame_count > stats.max_fifo_backlog) {
+		stats.max_fifo_backlog = frame_count;
+	}
+	for (int i = 0; i < frame_count; i++) {
+		if ((ret = icm_45686_get_fifo_frame(icm, &frame))) {
+			msg(INF, "ICM45686: get_fifo_frame() error (%s)\n", hwerr_str(ret));
+			return ((gfp_t) state_error);
 		}
-		if ((unsigned int) frame_count > stats.max_fifo_backlog) {
-			stats.max_fifo_backlog = frame_count;
+		stats.read_frame_cnt++;
+		last_frame_tick = xTaskGetTickCount();
+		report_data(&frame);
+	}
+	if (fifo_full) {
+		if ((ret = icm_45686_flush_fifo(icm))) {
+			msg(INF, "ICM45686: flush_fifo() error (%s)\n", hwerr_str(ret));
+			return ((gfp_t) state_error);
 		}
+	}
+	gpio_hal_intr_enable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
+	return ((gfp_t) wait_intr);
+}
+
+/**
+ * check_progress
+ */
+static gfp_t check_progress(void)
+{
+	if ((TickType_t) (xTaskGetTickCount() - last_frame_tick) >= ms_to_os_ticks(NO_FRAMES_TMO_MS)) {
+		stats.no_data_reset_cnt++;
+		msg(INF, "ICM45686: no FIFO frames for %u ms, restarting STM\n", NO_FRAMES_TMO_MS);
+		return ((gfp_t) state_error);
 	}
 	return ((gfp_t) wait_intr);
 }
@@ -398,21 +473,25 @@ static BaseType_t int1_isr_clbk(uint32_t status)
 {
 	BaseType_t tsk_wkn = pdFALSE;
 
+	if (!(status & ICM45686_INT1_PIN) ||
+	    !gpio_hal_is_intr_enabled(ICM45686_INT1_CONT, ICM45686_INT1_PIN)) {
+		return (tsk_wkn);
+	}
+	if (!irq_armed) {
+		stats.stale_irq_cnt++;
+		return (tsk_wkn);
+	}
 #if ICM45686_INTR_TYPE == LOW_LEVEL_INTR_TYPE
-	if (status & ICM45686_INT1_PIN &&
-	    gpio_hal_is_intr_enabled(ICM45686_INT1_CONT, ICM45686_INT1_PIN) &&
-	    gpio_hal_get_input(ICM45686_INT1_CONT, ICM45686_INT1_PIN) == GPIO_HAL_LOW) {
+	if (gpio_hal_get_input(ICM45686_INT1_CONT, ICM45686_INT1_PIN) == GPIO_HAL_LOW) {
 		gpio_hal_intr_disable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
 		xSemaphoreGiveFromISR(isr_sig, &tsk_wkn);
 	}
 #elif ICM45686_INTR_TYPE == FALL_EDGE_INTR_TYPE
-	if (status & ICM45686_INT1_PIN && gpio_hal_is_intr_enabled(ICM45686_INT1_CONT, ICM45686_INT1_PIN)) {
-		if (gpio_hal_get_input(ICM45686_INT1_CONT, ICM45686_INT1_PIN) == GPIO_HAL_HIGH) {
-			stats.irq_pin_high_cnt++;
-		}
-		gpio_hal_intr_disable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
-		xSemaphoreGiveFromISR(isr_sig, &tsk_wkn);
+	if (gpio_hal_get_input(ICM45686_INT1_CONT, ICM45686_INT1_PIN) == GPIO_HAL_HIGH) {
+		stats.irq_pin_high_cnt++;
 	}
+	gpio_hal_intr_disable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
+	xSemaphoreGiveFromISR(isr_sig, &tsk_wkn);
 #else
 #error "ICM45686_INTR_TYPE unknown"
 #endif
@@ -424,6 +503,8 @@ static BaseType_t int1_isr_clbk(uint32_t status)
  */
 static gfp_t state_error(void)
 {
+	gpio_hal_intr_disable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
+	irq_armed = FALSE;
 	msg(INF, "ICM45686: resetting state machine after error\n");
 	vTaskDelay(ms_to_os_ticks(RESET_STM_TMO_MS));
 	stats.stm_rst_cnt++;
@@ -561,6 +642,7 @@ static void report_data(union icm_45686_fifo_frame *frame)
 		}
 		sample.temp_raw = temp_raw;
 		sample.timestamp = fifo_timestamp;
+		sample.sequence = stats.read_frame_cnt;
 		sample.accel_valid = accel_data_valid;
 		sample.gyro_valid = gyro_data_valid;
 		sample.temp_valid = temp_data_valid;
@@ -657,6 +739,8 @@ static void cmd_icms(void)
 	    stats.fifo_empty_err_cnt, stats.stm_rst_cnt);
 	msg(INF, "ICM45686 cnt: irq_pin_high=%u timeout_fifo_nonempty=%u max_fifo_backlog=%u\n",
 	    stats.irq_pin_high_cnt, stats.timeout_fifo_nonempty_cnt, stats.max_fifo_backlog);
+	msg(INF, "ICM45686 cnt: stale_irq=%u no_data_reset=%u\n",
+	    stats.stale_irq_cnt, stats.no_data_reset_cnt);
 #if ICM45686_REPORT_FN == 1
 	msg(INF, "ICM45686 cnt: report_fn_err=%u\n", stats.report_fn_err_cnt);
 #endif

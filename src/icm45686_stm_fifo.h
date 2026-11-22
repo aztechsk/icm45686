@@ -28,7 +28,8 @@
  * - Both accel and gyro are enabled, with temperature and timestamp data.
  * - FIFO depth is 2 KiB (DEPTH_APEX), holding 128 standard 16-byte or
  *   102 high-resolution 20-byte packets; mode is SNAPSHOT (stop on full),
- *   not STREAM. The task does not flush or restart FIFO on FIFO_FULL.
+ *   not STREAM. On FIFO_FULL, the task drains queued packets and issues
+ *   FIFO_FLUSH before resuming acquisition.
  * - Watermark is one packet, with the interrupt condition count >= threshold.
  * - FIFO_THS and FIFO_FULL are routed to INT1; other sources are disabled.
  * - FIFO compression and external-sensor insertion are not supported by the
@@ -45,16 +46,29 @@
  *   even if the pin has already returned HIGH.
  * - LOW_LEVEL_INTR_TYPE: sensor LATCH output, GPIO low-level trigger; the
  *   callback also verifies that the pin is currently LOW.
- * The ISR disables its GPIO interrupt and signals a binary semaphore. The
- * task reads INT1 status, then FIFO_COUNT and all available packets when
- * FIFO_THS or FIFO_FULL is set, and re-enables GPIO interrupts. Each packet
- * is decoded and optionally reported synchronously in task context.
- * A missed pulse can delay servicing until a later event; FIFO is not a
- * lossless transport guarantee. After a 50 ms semaphore timeout, the task
- * checks WHO_AM_I and reads FIFO_COUNT for diagnostics only: it does not drain
- * FIFO on timeout. An ordinary SPI/status/frame error causes a reset and
- * reconfiguration attempt after a 5000 ms delay. A diagnostic FIFO_COUNT
- * read error is logged without triggering this recovery.
+ * At entry to recovery, GPIO INT1 is masked and the acquisition ISR is
+ * disarmed. On reset, the binary semaphore is drained. FIFO interrupt sources
+ * remain disabled until FIFO/ODR/FSR/filter setup is complete. The ISR is
+ * armed before GPIO INT1 is enabled: a pending PIO event is accepted,
+ * checked against FIFO status, and does not block recovery.
+ * After the GPIO write is synchronized with DSB, FIFO_THS/FIFO_FULL are
+ * routed to INT1, and both sensors enter Low-Noise mode. This STM does not
+ * clear PIO_ISR or NVIC pending state explicitly; the first FIFO packet
+ * is not discarded.
+ * The armed ISR disables its GPIO interrupt and signals a binary semaphore.
+ * The task reads INT1 status, then FIFO_COUNT and all available packets when
+ * FIFO_THS or FIFO_FULL is set. On FIFO_FULL, it flushes FIFO after draining,
+ * then re-enables GPIO interrupts. Each packet is decoded and optionally
+ * reported synchronously in task context.
+ * A missed interrupt triggers a 50 ms timeout fallback: the task masks
+ * GPIO INT1, checks WHO_AM_I, acknowledges INT1_STATUS and reads FIFO_COUNT.
+ * If data are present or FIFO_FULL is signaled, it drains any queued packets,
+ * flushes on FIFO_FULL, and re-enables GPIO INT1. If no packets are consumed
+ * for 1000 ms after the sensors start or the last good packet, the task enters
+ * recovery. SPI,
+ * status, FIFO count, frame decode and invalid FIFO count failures also
+ * enter recovery, with a 5000 ms delay before reinitialization. This STM
+ * does not guarantee lossless transport if FIFO fills or callbacks block.
  *
  * @par FIFO packet formats and physical units
  * ICM45686_FIFO_HIRES selects the fixed frame layout (little-endian data):
@@ -80,7 +94,7 @@
  * never in the GPIO ISR or after a failed SPI/FIFO read. The raw sample
  * callback runs once per decoded packet, including invalid sensor fields.
  * It receives signed raw accel/gyro, temperature, a 16-bit timestamp,
- * validity flags and the 16/20-bit format.
+ * a 32-bit packet sequence, validity flags and the 16/20-bit format.
  * Each measurement type has an independent output routing selector:
  * 0=off, 1=local msg(), 2=report_fn, 3=both. Existing 0/1 settings retain
  * their original local-logging meaning. When sent to both destinations,
@@ -139,12 +153,17 @@
  *
  * @par Diagnostics
  * The "icms" command reports read_frame_cnt, fifo_full, unknown_intr,
- * fifo_empty_err, stm_rst, irq_pin_high, timeout_fifo_nonempty and
- * max_fifo_backlog. irq_pin_high counts accepted falling-edge interrupts
- * sampled after the pin returned HIGH; it does not count dropped packets.
- * timeout_fifo_nonempty counts timeout checks finding data in FIFO, not
- * distinct lost interrupts. max_fifo_backlog is the largest count observed
- * at a FIFO read or diagnostic timeout, not an absolute hardware peak.
+ * fifo_empty_err, stm_rst, irq_pin_high, stale_irq, timeout_fifo_nonempty,
+ * no_data_reset and max_fifo_backlog. stale_irq counts GPIO callback events
+ * while acquisition is disarmed; they never set the semaphore. irq_pin_high
+ * counts accepted falling-edge interrupts sampled after the pin returned
+ * HIGH; it does not count dropped packets.
+ * timeout_fifo_nonempty counts timeout fallbacks that found a nonempty
+ * FIFO, not distinct lost interrupts. no_data_reset counts 1000 ms periods
+ * without a successfully read packet that triggered recovery. A stale
+ * pending interrupt may increment unknown_intr without stopping acquisition.
+ * max_fifo_backlog is the largest validated FIFO packet count passed for draining,
+ * including attempts that later fail; it is not an absolute hardware peak.
  * When enabled, report_fn_err and sample_fn_err count callbacks returning
  * FALSE. Counters are not cleared by an STM reset; they reset with firmware.
  *
@@ -193,7 +212,11 @@
  * 25 + temp_raw / 2 degC (16-bit mode) or 25 + temp_raw / 128 degC
  * (20-bit mode).
  * The raw 16-bit timestamp uses 1 us/tick with reset-default sensor settings
- * and wraps modulo 65536. The STM uses both accel and gyro in every packet.
+ * and wraps modulo 65536. The sequence is the 1-based read_frame_cnt value;
+ * it counts decoded packets, including packets with invalid sensor values,
+ * continues across sensor resets and wraps modulo 2^32. It does not detect
+ * packets lost inside the sensor FIFO. The STM uses both accel and gyro in
+ * every packet.
  *
  * @note data_bits is 16 or 20, selected by ICM45686_FIFO_HIRES at build time.
  * @note The pointer passed to the callback is valid only during that call.
@@ -207,6 +230,7 @@ struct icm45686_fifo_sample {
 	boolean_t gyro_valid; /**< TRUE if all three gyro axes are valid. */
 	boolean_t temp_valid; /**< TRUE if temperature is valid. */
 	uint8_t data_bits; /**< 16 (standard FIFO) or 20 (HIRES FIFO). */
+	uint32_t sequence; /**< 1-based decoded packet sequence, wraps modulo 2^32. */
 };
 #endif
 
@@ -256,7 +280,8 @@ void icm45686_stm_set_report_fn(boolean_t (*report_fn)(const char *));
  * @brief Install or clear the raw FIFO sample callback.
  *
  * Called for every decoded FIFO packet with raw signed acceleration, gyro
- * and temperature values, validity flags, 16-bit timestamp and format bits.
+ * and temperature values, validity flags, 16-bit timestamp, packet sequence
+ * and format bits.
  * A false validity flag does not suppress delivery. FALSE from the callback
  * increments sample_fn_err_cnt but does not reset acquisition.
  *

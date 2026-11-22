@@ -44,10 +44,13 @@
  * semaphore. The task reads INT1 status and, when UI DATA_READY is set, reads
  * 14 consecutive UI data-register bytes in one SPI burst. It then reports
  * the sample and re-enables GPIO interrupts.
- * A 50 ms semaphore timeout increments drdy_timeout_cnt and checks WHO_AM_I,
- * but does not read the data registers or reset the sensor if WHO_AM_I passes.
- * A failed sensor/SPI operation enters recovery: delay 5000 ms, soft reset and
- * reconfigure. The GPIO interrupt remains masked during sample reporting.
+ * A 50 ms semaphore timeout increments drdy_timeout_cnt and checks WHO_AM_I.
+ * If no successful data-register read occurs for 1000 ms
+ * (NO_DRDY_TMO_MS), no_data_reset_cnt increments and the STM enters the
+ * normal recovery path. A failed sensor/SPI operation also enters recovery:
+ * delay 5000 ms, soft reset and reconfigure. The GPIO interrupt remains
+ * masked during sample reporting and is disabled immediately on entering
+ * recovery, before the 5000 ms delay.
  *
  * @par Sampling limitations and raw data
  * Unlike the FIFO STM, direct register acquisition has no sample queue:
@@ -123,8 +126,10 @@
  * @par Diagnostics
  * The "icms" command reports read_data_reg (successful 14-byte reads),
  * unknown_intr (status lacked UI DATA_READY after an ISR wakeup),
- * drdy_timeout (50 ms semaphore wait timeouts) and stm_rst (recovery cycles).
- * drdy_timeout counts timeout occurrences, not the number of lost samples.
+ * drdy_timeout (50 ms semaphore wait timeouts), no_data_reset (watchdog-triggered
+ * restarts after 1000 ms without a successful sample read) and stm_rst
+ * (recovery cycles). drdy_timeout counts timeout occurrences, not the number
+ * of lost samples.
  * If built, report_fn_err and sample_fn_err count callbacks returning FALSE;
  * an unregistered callback is not counted as an error. Counters persist
  * through STM recovery and reset only when the firmware restarts.
