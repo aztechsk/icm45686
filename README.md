@@ -320,6 +320,13 @@ tasks/semaphores, GPIO and pinmux HALs, board definitions, command-line
 registration and `msg()` diagnostics. The parent firmware supplies `sysconf.h`,
 `board.h` and the platform backends; they are not provided by this library.
 
+**Compiler ABI:** The driver maps hardware register bits and FIFO header flags
+using C bit-fields. Their bit allocation order is implementation-defined. This
+implementation requires a compiler ABI that allocates these fields from the
+least significant bit to the most significant bit within each byte. Little-endian
+and structure-size assertions alone do not guarantee this layout. Verify
+bit-field compatibility when changing the compiler or target ABI.
+
 ## Reference
 
 TDK InvenSense ICM-45686 datasheet **DS-000577, revision 1.0**: power modes
