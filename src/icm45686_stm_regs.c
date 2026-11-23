@@ -35,7 +35,11 @@
 
 #if ICM45686_SENSOR_MODE == ICM45686_REGS_MODE
 
-#define RESET_STM_TMO_MS 5000
+#ifdef ICM45686_RESET_STM_TMO_MS
+#if ICM45686_RESET_STM_TMO_MS <= 0
+#error "ICM45686_RESET_STM_TMO_MS must be positive"
+#endif
+#endif
 #define WAIT_ISR_SIG_TMO_MS 50
 #define NO_DRDY_TMO_MS 1000U
 #define ICM45686_REPORT_TO_MSG 1U
@@ -85,6 +89,11 @@ static struct {
 	unsigned int drdy_timeout_cnt;
 	unsigned int no_data_reset_cnt;
 	unsigned int stm_rst_cnt;
+	unsigned int sw_reset_err_cnt;
+	unsigned int probe_err_cnt;
+	unsigned int cfg_err_cnt;
+	unsigned int int_stat_err_cnt;
+	unsigned int reg_data_err_cnt;
 #if ICM45686_REPORT_FN == 1
 	unsigned int report_fn_err_cnt;
 #endif
@@ -168,6 +177,7 @@ static gfp_t state_sw_reset(void)
 	gpio_hal_intr_disable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
 	ret = icm_45686_soft_reset(icm);
 	if (ret) {
+		stats.sw_reset_err_cnt++;
 		msg(INF, "ICM45686: Soft reset error (%s)\n", hwerr_str(ret));
 		return ((gfp_t) state_error);
 	}
@@ -184,6 +194,7 @@ static gfp_t state_whoami_check(void)
 
 	ret = icm_45686_whoami_check(icm);
 	if (ret) {
+		stats.probe_err_cnt++;
 		msg(INF, "ICM45686: whoami_check() error (%s)\n", hwerr_str(ret));
 		return ((gfp_t) state_error);
 	}
@@ -199,6 +210,7 @@ static gfp_t set_spi_slew(void)
 
 	ret = icm_45686_set_spi_pads_slew(icm, ICM45686_PADS_SPI_SLEW);
 	if (ret) {
+		stats.cfg_err_cnt++;
 		msg(INF, "ICM45686: set_spi_slew() error (%s)\n", hwerr_str(ret));
 		return ((gfp_t) state_error);
 	}
@@ -250,6 +262,7 @@ static gfp_t intr_cfg(void)
 	}
 	return ((gfp_t) accel_gyro_cfg);
 err:
+	stats.cfg_err_cnt++;
 	msg(INF, "ICM45686: intr_cfg() error (%s)\n", hwerr_str(ret));
 	return ((gfp_t) state_error);
 }
@@ -304,6 +317,7 @@ static gfp_t accel_gyro_cfg(void)
 	gpio_hal_intr_enable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
 	return ((gfp_t) wait_intr);
 err:
+	stats.cfg_err_cnt++;
 	msg(INF, "ICM45686: accel_gyro_cfg() error (%s)\n", hwerr_str(ret));
 	return ((gfp_t) state_error);
 }
@@ -322,11 +336,13 @@ static gfp_t wait_intr(void)
 		return ((gfp_t) ping_icm);
 	}
 	if ((ret = icm_45686_get_int_status(icm, ICM_45686_INT1, &is))) {
+		stats.int_stat_err_cnt++;
 		msg(INF, "ICM45686: get_int_status() error (%s)\n", hwerr_str(ret));
 		return ((gfp_t) state_error);
 	}
 	if (is.ui_drdy) {
 		if ((ret = icm_45686_get_reg_data(icm, &sd))) {
+			stats.reg_data_err_cnt++;
 			msg(INF, "ICM45686: get_reg_data() error (%s)\n", hwerr_str(ret));
 			return ((gfp_t) state_error);
 		}
@@ -353,6 +369,7 @@ static gfp_t ping_icm(void)
 
 	ret = icm_45686_whoami_check(icm);
 	if (ret) {
+		stats.probe_err_cnt++;
 		msg(INF, "ICM45686: ping_icm() error (%s)\n", hwerr_str(ret));
 		return ((gfp_t) state_error);
 	}
@@ -404,7 +421,9 @@ static gfp_t state_error(void)
 {
 	gpio_hal_intr_disable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
 	msg(INF, "ICM45686: resetting state machine after error\n");
-	vTaskDelay(ms_to_os_ticks(RESET_STM_TMO_MS));
+#ifdef ICM45686_RESET_STM_TMO_MS
+	vTaskDelay(ms_to_os_ticks(ICM45686_RESET_STM_TMO_MS));
+#endif
 	stats.stm_rst_cnt++;
 	return ((gfp_t) state_sw_reset);
 }
@@ -531,6 +550,9 @@ static void cmd_icms(void)
 #if ICM45686_REPORT_SAMPLE_FN == 1
 	msg(INF, "ICM45686 cnt: sample_fn_err=%u\n", stats.sample_fn_err_cnt);
 #endif
+	msg(INF, "ICM45686 STM err: sw_reset=%u probe=%u cfg=%u int_stat=%u reg_data=%u\n",
+	    stats.sw_reset_err_cnt, stats.probe_err_cnt, stats.cfg_err_cnt,
+	    stats.int_stat_err_cnt, stats.reg_data_err_cnt);
 	vTaskPrioritySet(NULL, pr);
 }
 #endif

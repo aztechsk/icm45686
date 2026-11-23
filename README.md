@@ -143,7 +143,7 @@ the silicon. Neither STM exposes runtime changes to ODR, FSR, filters or FIFO se
 | INT1 source | `UI_DRDY` | `FIFO_THS` and `FIFO_FULL` |
 | Completion wait | Binary semaphore, 50 ms timeout | Binary semaphore, 50 ms timeout and FIFO fallback |
 | No-data watchdog | 1000 ms since last successful register read | 1000 ms since last successfully read packet |
-| Recovery | Mask INT1; wait 5000 ms; reset/reconfigure | Same, including FIFO reconfiguration |
+| Recovery | Mask INT1; optional retry backoff; reset/reconfigure | Same, including FIFO reconfiguration |
 
 The REGS STM waits approximately 70 ms for gyro startup before routing DATA_READY to INT1.
 It can overwrite unread conversions and does not detect missing intermediate samples.
@@ -165,6 +165,7 @@ constants where applicable. The `sysconf.h` switches below do **not** change the
 | `ICM45686_TASK_PRIO` | yes | yes | Acquisition FreeRTOS task priority |
 | `ICM45686_TASK_STACK_SIZE` | yes | yes | Acquisition task stack depth (FreeRTOS units) |
 | `ICM45686_INTR_TYPE` | yes | yes | `LOW_LEVEL_INTR_TYPE` or `FALL_EDGE_INTR_TYPE` |
+| `ICM45686_RESET_STM_TMO_MS` | optional | optional | Client-defined recovery backoff in milliseconds |
 | `ICM45686_PADS_SPI_SLEW` | yes | yes | SPI slew selector from `ICM_45686_DRIVE_CONFIG0_PADS_SPI_SLEW_*` |
 | `ICM45686_FIFO_HIRES` | - | yes | `0` for 16-byte packets, `1` for 20-byte HIRES packets |
 | `ICM45686_REPORT_ACCEL_SI` / `ICM45686_REPORT_GYRO_SI` | yes | yes | Text reports in g / dps |
@@ -180,7 +181,16 @@ The non-board settings are supplied through project configuration; the controlle
 assignments come from `board.h`. `ICM45686_REPORT_FN`, `ICM45686_REPORT_SAMPLE_FN` and
 `ICM45686_REPORT_MSG_NUM` have documented header defaults of `0`. Define the report routing
 selectors explicitly in the parent project, even when unused. The FIFO resolution switch
-accepts only `0` or `1`.
+accepts only `0` or `1`. `ICM45686_RESET_STM_TMO_MS` is an optional STM setting
+in `sysconf.h`. If omitted, recovery attempts the next soft reset without
+an additional delay. When defined, its value must be positive and convert
+through `ms_to_os_ticks()` to at least one FreeRTOS tick. One tick is
+the smallest nonzero scheduler delay, but the actual elapsed time may be
+shorter than a full tick period; the millisecond threshold depends on the
+RTOS tick rate. This is a retry backoff, not a silicon reset-stabilization
+requirement: `icm_45686_soft_reset()` already
+waits for reset completion and device stabilization. Choose a longer
+backoff when persistent failures could otherwise cause rapid retries.
 
 For either STM, `ICM45686_INTR_TYPE` selects a consistent sensor/GPIO interrupt pair:
 
@@ -265,10 +275,11 @@ are independent: disabling text does not stop measurement acquisition.
 ## Errors and diagnostics
 
 Both STMs enter recovery on failed sensor/SPI operations or when the 1000 ms
-no-data watchdog expires. Recovery masks INT1, waits approximately 5 seconds,
-then attempts reset and reconfiguration. REGS timeout checks WHO_AM_I; FIFO
-timeout additionally inspects interrupt status and FIFO_COUNT. Neither STM
-calls an application callback for failed SPI reads.
+no-data watchdog expires. Recovery masks INT1, optionally waits for
+`ICM45686_RESET_STM_TMO_MS`, then attempts reset and reconfiguration.
+A 50 ms REGS timeout checks WHO_AM_I; the FIFO timeout also checks interrupt
+status and FIFO_COUNT.
+Neither STM calls an application callback for failed SPI reads.
 
 The `icms` command shows mode-specific counters:
 
@@ -282,6 +293,19 @@ The `icms` command shows mode-specific counters:
   drained or the hardware peak.
 - With callbacks enabled, `report_fn_err` and/or `sample_fn_err` count callbacks
   returning `FALSE`. Diagnostics survive STM recovery and reset on firmware restart.
+
+An additional `ICM45686 STM err` line (two lines in FIFO mode) records
+fatal-recovery causes. REGS reports `sw_reset`, `probe`, `cfg`, `int_stat`
+and `reg_data`; FIFO reports `sw_reset`, `probe`, `cfg`, `int_stat`,
+`fifo_count`, `fifo_frame` and `fifo_flush`. `probe` covers WHO_AM_I
+checks during initialization and fallback; `cfg` covers configuration
+failures, including initialization-time status reads. `fifo_count` also
+counts invalid packet-count values. Existing `no_data_reset` already
+records watchdog-triggered recovery. Each fatal transition increments
+exactly one cause counter. `stm_rst` increments after the recovery delay,
+so it may temporarily trail the sum of causes by one. Nonfatal counters
+(e.g. `drdy_timeout`, `fifo_full` or `fifo_empty_err`) keep their original
+meaning. No counters are reset by STM recovery.
 
 The state machines deliberately provide no delivery queue, guaranteed sample
 cadence, runtime sensor reconfiguration or automatic application-side filtering.

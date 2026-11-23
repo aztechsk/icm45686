@@ -39,7 +39,11 @@
 #error "ICM45686_FIFO_HIRES must be 0 or 1"
 #endif
 
-#define RESET_STM_TMO_MS 5000
+#ifdef ICM45686_RESET_STM_TMO_MS
+#if ICM45686_RESET_STM_TMO_MS <= 0
+#error "ICM45686_RESET_STM_TMO_MS must be positive"
+#endif
+#endif
 #define WAIT_ISR_SIG_TMO_MS 50
 #define NO_FRAMES_TMO_MS 1000U
 #if ICM45686_FIFO_HIRES == 1
@@ -104,6 +108,13 @@ static struct {
 	unsigned int unknown_intr_cnt;
 	unsigned int fifo_empty_err_cnt;
 	unsigned int stm_rst_cnt;
+	unsigned int sw_reset_err_cnt;
+	unsigned int probe_err_cnt;
+	unsigned int cfg_err_cnt;
+	unsigned int int_stat_err_cnt;
+	unsigned int fifo_count_err_cnt;
+	unsigned int fifo_frame_err_cnt;
+	unsigned int fifo_flush_err_cnt;
 #if ICM45686_REPORT_FN == 1
 	unsigned int report_fn_err_cnt;
 #endif
@@ -190,6 +201,7 @@ static gfp_t state_sw_reset(void)
 	(void) xSemaphoreTake(isr_sig, 0);
 	ret = icm_45686_soft_reset(icm);
 	if (ret) {
+		stats.sw_reset_err_cnt++;
 		msg(INF, "ICM45686: Soft reset error (%s)\n", hwerr_str(ret));
 		return ((gfp_t) state_error);
 	}
@@ -206,6 +218,7 @@ static gfp_t state_whoami_check(void)
 
 	ret = icm_45686_whoami_check(icm);
 	if (ret) {
+		stats.probe_err_cnt++;
 		msg(INF, "ICM45686: whoami_check() error (%s)\n", hwerr_str(ret));
 		return ((gfp_t) state_error);
 	}
@@ -221,6 +234,7 @@ static gfp_t set_spi_slew(void)
 
 	ret = icm_45686_set_spi_pads_slew(icm, ICM45686_PADS_SPI_SLEW);
 	if (ret) {
+		stats.cfg_err_cnt++;
 		msg(INF, "ICM45686: set_spi_slew() error (%s)\n", hwerr_str(ret));
 		return ((gfp_t) state_error);
 	}
@@ -272,6 +286,7 @@ static gfp_t intr_cfg(void)
 	}
 	return ((gfp_t) accel_gyro_cfg);
 err:
+	stats.cfg_err_cnt++;
 	msg(INF, "ICM45686: intr_cfg() error (%s)\n", hwerr_str(ret));
 	return ((gfp_t) state_error);
 }
@@ -337,6 +352,7 @@ static gfp_t accel_gyro_cfg(void)
 	last_frame_tick = xTaskGetTickCount();
 	return ((gfp_t) wait_intr);
 err:
+	stats.cfg_err_cnt++;
 	msg(INF, "ICM45686: accel_gyro_cfg() error (%s)\n", hwerr_str(ret));
 	return ((gfp_t) state_error);
 }
@@ -354,6 +370,7 @@ static gfp_t wait_intr(void)
 		return ((gfp_t) ping_icm);
 	}
 	if ((ret = icm_45686_get_int_status(icm, ICM_45686_INT1, &is))) {
+		stats.int_stat_err_cnt++;
 		msg(INF, "ICM45686: get_int_status() error (%s)\n", hwerr_str(ret));
 		return ((gfp_t) state_error);
 	}
@@ -362,10 +379,12 @@ static gfp_t wait_intr(void)
 	}
 	if (is.fifo_ths || is.fifo_full) {
 		if ((ret = icm_45686_get_frame_count(icm, &frame_count))) {
+			stats.fifo_count_err_cnt++;
 			msg(INF, "ICM45686: get_frame_count() error (%s)\n", hwerr_str(ret));
 			return ((gfp_t) state_error);
 		}
 		if (frame_count < 0 || frame_count > FIFO_MAX_FRAMES) {
+			stats.fifo_count_err_cnt++;
 			msg(INF, "ICM45686: invalid FIFO_COUNT=%d\n", frame_count);
 			return ((gfp_t) state_error);
 		}
@@ -395,10 +414,12 @@ static gfp_t ping_icm(void)
 	gpio_hal_intr_disable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
 	(void) xSemaphoreTake(isr_sig, 0);
 	if ((ret = icm_45686_whoami_check(icm))) {
+		stats.probe_err_cnt++;
 		msg(INF, "ICM45686: ping_icm() error (%s)\n", hwerr_str(ret));
 		return ((gfp_t) state_error);
 	}
 	if ((ret = icm_45686_get_int_status(icm, ICM_45686_INT1, &is))) {
+		stats.int_stat_err_cnt++;
 		msg(INF, "ICM45686: ping_icm() get_int_status() error (%s)\n", hwerr_str(ret));
 		return ((gfp_t) state_error);
 	}
@@ -406,10 +427,12 @@ static gfp_t ping_icm(void)
 		stats.fifo_full_cnt++;
 	}
 	if ((ret = icm_45686_get_frame_count(icm, &frame_count))) {
+		stats.fifo_count_err_cnt++;
 		msg(INF, "ICM45686: ping_icm() get_frame_count() error (%s)\n", hwerr_str(ret));
 		return ((gfp_t) state_error);
 	}
 	if (frame_count < 0 || frame_count > FIFO_MAX_FRAMES) {
+		stats.fifo_count_err_cnt++;
 		msg(INF, "ICM45686: invalid FIFO_COUNT=%d\n", frame_count);
 		return ((gfp_t) state_error);
 	}
@@ -436,6 +459,7 @@ static gfp_t read_fifo_frames(int frame_count, boolean_t fifo_full)
 	}
 	for (int i = 0; i < frame_count; i++) {
 		if ((ret = icm_45686_get_fifo_frame(icm, &frame))) {
+			stats.fifo_frame_err_cnt++;
 			msg(INF, "ICM45686: get_fifo_frame() error (%s)\n", hwerr_str(ret));
 			return ((gfp_t) state_error);
 		}
@@ -445,6 +469,7 @@ static gfp_t read_fifo_frames(int frame_count, boolean_t fifo_full)
 	}
 	if (fifo_full) {
 		if ((ret = icm_45686_flush_fifo(icm))) {
+			stats.fifo_flush_err_cnt++;
 			msg(INF, "ICM45686: flush_fifo() error (%s)\n", hwerr_str(ret));
 			return ((gfp_t) state_error);
 		}
@@ -506,7 +531,9 @@ static gfp_t state_error(void)
 	gpio_hal_intr_disable(ICM45686_INT1_CONT, ICM45686_INT1_PIN);
 	irq_armed = FALSE;
 	msg(INF, "ICM45686: resetting state machine after error\n");
-	vTaskDelay(ms_to_os_ticks(RESET_STM_TMO_MS));
+#ifdef ICM45686_RESET_STM_TMO_MS
+	vTaskDelay(ms_to_os_ticks(ICM45686_RESET_STM_TMO_MS));
+#endif
 	stats.stm_rst_cnt++;
 	return ((gfp_t) state_sw_reset);
 }
@@ -747,6 +774,10 @@ static void cmd_icms(void)
 #if ICM45686_REPORT_SAMPLE_FN == 1
 	msg(INF, "ICM45686 cnt: sample_fn_err=%u\n", stats.sample_fn_err_cnt);
 #endif
+	msg(INF, "ICM45686 STM err: sw_reset=%u probe=%u cfg=%u int_stat=%u\n",
+	    stats.sw_reset_err_cnt, stats.probe_err_cnt, stats.cfg_err_cnt, stats.int_stat_err_cnt);
+	msg(INF, "ICM45686 STM err: fifo_count=%u fifo_frame=%u fifo_flush=%u\n",
+	    stats.fifo_count_err_cnt, stats.fifo_frame_err_cnt, stats.fifo_flush_err_cnt);
 	vTaskPrioritySet(NULL, pr);
 }
 #endif

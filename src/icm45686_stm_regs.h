@@ -48,9 +48,9 @@
  * If no successful data-register read occurs for 1000 ms
  * (NO_DRDY_TMO_MS), no_data_reset_cnt increments and the STM enters the
  * normal recovery path. A failed sensor/SPI operation also enters recovery:
- * delay 5000 ms, soft reset and reconfigure. The GPIO interrupt remains
- * masked during sample reporting and is disabled immediately on entering
- * recovery, before the 5000 ms delay.
+ * optionally wait before soft reset and reconfiguration. The GPIO interrupt
+ * remains masked during sample reporting and is disabled immediately on
+ * entering recovery, before any configured backoff.
  *
  * @par Sampling limitations and raw data
  * Unlike the FIFO STM, direct register acquisition has no sample queue:
@@ -97,6 +97,9 @@
  * - ICM45686_TASK_PRIO / ICM45686_TASK_STACK_SIZE: FreeRTOS task priority
  *   and stack depth (StackType_t units).
  * - ICM45686_INTR_TYPE: LOW_LEVEL_INTR_TYPE or FALL_EDGE_INTR_TYPE.
+ * - ICM45686_RESET_STM_TMO_MS: optional recovery backoff in milliseconds,
+ *   set by the client in sysconf.h. If omitted, no backoff is applied.
+ *   A positive value must convert to at least one FreeRTOS tick.
  * - ICM45686_PADS_SPI_SLEW: SPI pad slew programmed after reset.
  * - ICM45686_REPORT_ACCEL_SI / ICM45686_REPORT_GYRO_SI: XYZ in g or dps,
  *   with two decimals, plus die temperature in degC.
@@ -129,7 +132,13 @@
  * drdy_timeout (50 ms semaphore wait timeouts), no_data_reset (watchdog-triggered
  * restarts after 1000 ms without a successful sample read) and stm_rst
  * (recovery cycles). drdy_timeout counts timeout occurrences, not the number
- * of lost samples.
+ * of lost samples. The additional "ICM45686 STM err" counters record
+ * fatal failures: sw_reset (sensor reset), probe (WHO_AM_I checks),
+ * cfg (SPI slew, INT1 or accel/gyro configuration), int_stat (INT1 status
+ * read during acquisition), and reg_data (14-byte UI data read). Each
+ * fatal transition increments one reason counter, including no_data_reset.
+ * stm_rst increments after the configured recovery delay, so it may
+ * temporarily lag behind the sum of fatal reason counters.
  * If built, report_fn_err and sample_fn_err count callbacks returning FALSE;
  * an unregistered callback is not counted as an error. Counters persist
  * through STM recovery and reset only when the firmware restarts.

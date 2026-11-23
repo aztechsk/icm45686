@@ -67,8 +67,9 @@
  * for 1000 ms after the sensors start or the last good packet, the task enters
  * recovery. SPI,
  * status, FIFO count, frame decode and invalid FIFO count failures also
- * enter recovery, with a 5000 ms delay before reinitialization. This STM
- * does not guarantee lossless transport if FIFO fills or callbacks block.
+ * enter recovery, optionally waiting before reset according to
+ * ICM45686_RESET_STM_TMO_MS. This STM does not guarantee lossless
+ * transport if FIFO fills or callbacks block.
  *
  * @par FIFO packet formats and physical units
  * ICM45686_FIFO_HIRES selects the fixed frame layout (little-endian data):
@@ -113,6 +114,9 @@
  * - ICM45686_TASK_PRIO / ICM45686_TASK_STACK_SIZE: FreeRTOS task priority
  *   and stack depth (StackType_t units).
  * - ICM45686_INTR_TYPE: LOW_LEVEL_INTR_TYPE or FALL_EDGE_INTR_TYPE.
+ * - ICM45686_RESET_STM_TMO_MS: optional recovery backoff in milliseconds,
+ *   set by the client in sysconf.h. If omitted, no backoff is applied.
+ *   A positive value must convert to at least one FreeRTOS tick.
  * - ICM45686_FIFO_HIRES: 0 for 16-byte, 1 for 20-byte packets.
  * - ICM45686_REPORT_ACCEL_SI / ICM45686_REPORT_GYRO_SI: report XYZ in g
  *   or dps, respectively, with two decimal places.
@@ -164,6 +168,14 @@
  * pending interrupt may increment unknown_intr without stopping acquisition.
  * max_fifo_backlog is the largest validated FIFO packet count passed for draining,
  * including attempts that later fail; it is not an absolute hardware peak.
+ * The additional "ICM45686 STM err" counters record fatal failures:
+ * sw_reset (sensor reset), probe (WHO_AM_I checks), cfg (SPI slew, INT1
+ * or accel/gyro/FIFO configuration), int_stat (INT1 status during
+ * acquisition), fifo_count (FIFO_COUNT read/range check), fifo_frame
+ * (packet read/decode) and fifo_flush (FIFO flush). Each fatal transition
+ * increments one reason counter, including no_data_reset. stm_rst
+ * increments after the configured recovery delay, so it may temporarily
+ * lag behind the sum of fatal reason counters.
  * When enabled, report_fn_err and sample_fn_err count callbacks returning
  * FALSE. Counters are not cleared by an STM reset; they reset with firmware.
  *
