@@ -135,7 +135,7 @@ static gfp_t check_progress(void);
 static BaseType_t int1_isr_clbk(uint32_t status);
 static gfp_t state_error(void);
 static void tsk(void *p);
-static void report_data(union icm_45686_fifo_frame *frame) __attribute__((unused));
+static void report_data(union icm_45686_fifo_frame *frame);
 static void cmd_icms(void);
 
 /**
